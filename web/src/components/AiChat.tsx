@@ -1,12 +1,11 @@
 import {
+  forwardRef,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useMemo,
   useRef,
   useState,
-  type ClipboardEvent as ReactClipboardEvent,
-  type ChangeEvent,
-  type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
@@ -21,6 +20,7 @@ import {
   getAiChatThread,
   interruptAiChatRun,
   listAiChatThreads,
+  listAiChatThreadsForIssueIdentifier,
   startAiChatTurn,
   subscribeAiChatThread,
   updateAiChatThread,
@@ -33,16 +33,14 @@ import {
   chatPrimaryAction,
   createAiSnapshotRefreshQueue,
   filterVisibleAiEvents,
-  needsDangerConfirmation,
+  isCodexModelResumeWarning,
   normalizeChatSelection,
-  parseAiChatComposerFragment,
   patchAiChatSnapshot,
   reasoningEffortForModel,
 } from "../aiChatState";
 import type {
   AiChatCatalog,
   AiChatEvent,
-  AiChatAttachmentInput,
   AiChatModel,
   AiChatRun,
   AiChatSandbox,
@@ -56,19 +54,25 @@ interface AiChatProps {
   available: boolean;
   projectId: string | null;
   issueId: string | null;
+  issueIdentifier?: string | null;
+  repositoryProjectId?: string | null;
+  repositoryOptions?: Array<{ id: string; name: string }>;
+  repositoryLoading?: boolean;
+  onRepositoryChange?: (projectId: string) => void;
+  hideRepositoryPicker?: boolean;
+  inline?: boolean;
+  onOpenThread?: (threadId: string, title?: string) => void;
 }
 
-type MenuName = "model" | "model-list" | "effort-list" | "sandbox" | null;
-type PendingDangerInput = {
-  message: string;
-  skillIds: string[];
-  attachments: AiChatAttachmentInput[];
-  clearSubmittedDraft: boolean;
-};
-type ComposerAttachment = AiChatAttachmentInput & {
-  id: string;
-  previewUrl?: string;
-};
+export interface AiChatHandle {
+  showThread(thread: AiChatThread): void;
+  startSkillAction(input: {
+    message: string;
+    skillId: string;
+  }): Promise<boolean>;
+}
+
+type MenuName = "model" | "effort-list" | "sandbox" | null;
 type ComposerSkillToken = {
   key: string;
   id: string;
@@ -112,26 +116,10 @@ const PANEL_DEFAULT_GEOMETRY: PanelGeometry = {
   width: 420,
   height: 700,
 };
+const DEFAULT_AI_MODEL = "gpt-5.6-luna";
+const DEFAULT_AI_SANDBOX: AiChatSandbox = "danger-full-access";
 const SKILL_MARKER = AI_CHAT_SKILL_MARKER;
 const SKILL_LINK_PREFIX = "#ai-chat-skill-";
-const COMPOSER_FRAGMENT_MIME = "application/x-codex-taskboard-composer-fragment";
-const COMPOSER_HTML_BLOCKS = new Set([
-  "ADDRESS",
-  "ARTICLE",
-  "BLOCKQUOTE",
-  "DIV",
-  "H1",
-  "H2",
-  "H3",
-  "H4",
-  "H5",
-  "H6",
-  "LI",
-  "P",
-  "PRE",
-  "SECTION",
-]);
-const COMPOSER_HTML_IGNORED = new Set(["SCRIPT", "STYLE", "SVG"]);
 const SANDBOX_LABELS: Record<AiChatSandbox, string> = {
   "read-only": "请求批准",
   "workspace-write": "替我审批",
@@ -260,186 +248,8 @@ function serializeComposer(root: HTMLElement): { message: string; skillIds: stri
   return { message, skillIds };
 }
 
-function selectedComposerFragment(root: HTMLElement): {
-  message: string;
-  skillIds: string[];
-  range: Range;
-} | null {
-  const selection = root.ownerDocument.getSelection();
-  const selectionRange = selection?.rangeCount ? selection.getRangeAt(0) : null;
-  if (
-    !selection
-    || selection.isCollapsed
-    || !selectionRange
-    || !root.contains(selectionRange.commonAncestorContainer)
-  ) {
-    return null;
-  }
-  const skillReferenceAt = (node: Node): HTMLElement | null => {
-    const element = node instanceof HTMLElement ? node : node.parentElement;
-    const composerToken = element?.closest<HTMLElement>(".ai-chat-composer-skill-token") ?? null;
-    if (composerToken && root.contains(composerToken)) return composerToken;
-    const reference = element?.closest<HTMLElement>("[data-skill-id]") ?? null;
-    return reference && root.contains(reference) ? reference : null;
-  };
-  const copyRange = selectionRange.cloneRange();
-  const startSkill = skillReferenceAt(copyRange.startContainer);
-  const endSkill = skillReferenceAt(copyRange.endContainer);
-  if (startSkill) copyRange.setStartBefore(startSkill);
-  if (endSkill) copyRange.setEndAfter(endSkill);
-  const wrapper = root.ownerDocument.createElement("div");
-  wrapper.append(copyRange.cloneContents());
-  const fragment = serializeComposer(wrapper);
-  return fragment.message ? { ...fragment, range: copyRange } : null;
-}
-
 function composerMarkerCount(message: string): number {
   return message.split(SKILL_MARKER).length - 1;
-}
-
-function canonicalComposerFragment(
-  fragment: { message: string; skillIds: string[] },
-  skillsById: Map<string, AiChatSkill>,
-): string {
-  let index = 0;
-  return fragment.message.replaceAll(SKILL_MARKER, () => {
-    const skillId = fragment.skillIds[index] ?? "";
-    index += 1;
-    const skill = skillsById.get(skillId);
-    return skill ? `[$${skill.id}](${skill.path})` : SKILL_MARKER;
-  });
-}
-
-function composerFragmentHtml(
-  fragment: { message: string; skillIds: string[] },
-  skillsById: Map<string, AiChatSkill>,
-  document: Document,
-): string {
-  const wrapper = document.createElement("div");
-  const parts = fragment.message.split(SKILL_MARKER);
-  parts.forEach((part, index) => {
-    if (index > 0) {
-      const skill = skillsById.get(fragment.skillIds[index - 1] ?? "");
-      if (skill) {
-        const link = document.createElement("a");
-        link.setAttribute("href", skill.path);
-        link.textContent = skillDisplayName(skill);
-        wrapper.append(link);
-      } else {
-        wrapper.append(SKILL_MARKER);
-      }
-    }
-    const lines = part.split("\n");
-    lines.forEach((line, lineIndex) => {
-      if (lineIndex > 0) wrapper.append(document.createElement("br"));
-      wrapper.append(line);
-    });
-  });
-  return wrapper.innerHTML;
-}
-
-function writeSkillFragmentToClipboard(
-  event: ReactClipboardEvent<HTMLElement>,
-  fragment: { message: string; skillIds: string[] },
-  skillsById: Map<string, AiChatSkill>,
-): boolean {
-  if (
-    fragment.skillIds.length === 0
-    || !fragment.skillIds.every((skillId) => skillsById.has(skillId))
-  ) {
-    return false;
-  }
-  event.preventDefault();
-  event.clipboardData.setData(COMPOSER_FRAGMENT_MIME, JSON.stringify({
-    message: fragment.message,
-    skillIds: fragment.skillIds,
-  }));
-  event.clipboardData.setData("text/plain", canonicalComposerFragment(fragment, skillsById));
-  event.clipboardData.setData(
-    "text/html",
-    composerFragmentHtml(fragment, skillsById, event.currentTarget.ownerDocument),
-  );
-  return true;
-}
-
-function decodedSkillPath(href: string): string | null {
-  const raw = href.trim();
-  if (!raw) return null;
-  try {
-    if (raw.startsWith("file:")) return decodeURIComponent(new URL(raw).pathname);
-    if (!raw.startsWith("/")) return null;
-    return decodeURIComponent(raw.split(/[?#]/, 1)[0]);
-  } catch {
-    return null;
-  }
-}
-
-function composerFragmentFromHtml(
-  html: string,
-  skills: AiChatSkill[],
-): { message: string; skillIds: string[] } | null {
-  if (!html || skills.length === 0) return null;
-  const document = new DOMParser().parseFromString(html, "text/html");
-  const skillsByPath = new Map(skills.map((skill) => [skill.path, skill]));
-  const skillIds: string[] = [];
-  let message = "";
-  let matchedSkill = false;
-  const appendText = (value: string) => {
-    message += value.replaceAll(SKILL_MARKER, "\uFFFD");
-  };
-  const visit = (node: Node) => {
-    if (node.nodeType === Node.TEXT_NODE) {
-      appendText(node.textContent ?? "");
-      return;
-    }
-    if (node.nodeType !== Node.ELEMENT_NODE) return;
-    const element = node as HTMLElement;
-    if (COMPOSER_HTML_IGNORED.has(element.tagName)) return;
-    if (element.tagName === "A") {
-      const path = decodedSkillPath(element.getAttribute("href") ?? "");
-      const skill = path?.endsWith("/SKILL.md") ? skillsByPath.get(path) : null;
-      if (skill) {
-        message += SKILL_MARKER;
-        skillIds.push(skill.id);
-        matchedSkill = true;
-        return;
-      }
-    }
-    if (element.tagName === "BR") {
-      message += "\n";
-      return;
-    }
-    const isBlock = COMPOSER_HTML_BLOCKS.has(element.tagName);
-    if (isBlock && message && !message.endsWith("\n")) message += "\n";
-    for (const child of element.childNodes) visit(child);
-    if (isBlock && element.nextSibling && !message.endsWith("\n")) message += "\n";
-  };
-  for (const child of document.body.childNodes) visit(child);
-  return matchedSkill ? { message, skillIds } : null;
-}
-
-function composerFragmentFromPlainText(
-  text: string,
-  skills: AiChatSkill[],
-): { message: string; skillIds: string[] } | null {
-  if (!text || skills.length === 0) return null;
-  const skillsByPath = new Map(skills.map((skill) => [skill.path, skill]));
-  const skillIds: string[] = [];
-  let message = "";
-  let cursor = 0;
-  const referencePattern = /\[\$([^\]\r\n]+)\]\((\/[^)\r\n]*\/SKILL\.md)\)/g;
-  for (const match of text.matchAll(referencePattern)) {
-    const path = decodedSkillPath(match[2]);
-    const skill = path ? skillsByPath.get(path) : null;
-    if (!skill || skill.id !== match[1]) continue;
-    message += text.slice(cursor, match.index).replaceAll(SKILL_MARKER, "\uFFFD");
-    message += SKILL_MARKER;
-    skillIds.push(skill.id);
-    cursor = (match.index ?? 0) + match[0].length;
-  }
-  if (skillIds.length === 0) return null;
-  message += text.slice(cursor).replaceAll(SKILL_MARKER, "\uFFFD");
-  return { message, skillIds };
 }
 
 function composerSkillQueryAt(
@@ -603,6 +413,7 @@ function dateLabel(value: string): string {
 }
 
 type ThinkingActivityDetail =
+  | { kind: "files"; summary: string; value: string[] }
   | { kind: "lines"; summary: string; value: string[] }
   | { kind: "pre"; summary: string; value: string };
 
@@ -626,7 +437,7 @@ function activityDetail(event: AiChatEvent): ThinkingActivityDetail | null {
   if (Array.isArray(files)) {
     const visibleFiles = files.filter((value): value is string => typeof value === "string");
     if (visibleFiles.length > 0) {
-      return { kind: "lines", summary: "查看文件", value: visibleFiles };
+      return { kind: "files", summary: "查看文件", value: visibleFiles };
     }
   }
   if (event.type === "todo" || event.type === "todo_list") {
@@ -659,9 +470,11 @@ function activityDetailSummary(event: AiChatEvent): string {
 
 function MarkdownMessage({
   children,
+  onOpenNativeReview,
   skillsById,
 }: {
   children: string;
+  onOpenNativeReview?: () => void;
   skillsById?: Map<string, AiChatSkill>;
 }) {
   return (
@@ -673,6 +486,18 @@ function MarkdownMessage({
             if (href?.startsWith(SKILL_LINK_PREFIX)) {
               const skillId = decodeURIComponent(href.slice(SKILL_LINK_PREFIX.length));
               return <SkillReference skill={skillsById?.get(skillId)} skillId={skillId} />;
+            }
+            if (onOpenNativeReview && (href?.startsWith("/Users/") || href?.startsWith("file:///"))) {
+              return (
+                <a
+                  {...props}
+                  href={href}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    onOpenNativeReview();
+                  }}
+                />
+              );
             }
             return <a {...props} href={href} target="_blank" rel="noreferrer" />;
           },
@@ -686,10 +511,27 @@ function MarkdownMessage({
 
 function ThinkingStepDetail({
   detail,
+  onOpenNativeReview,
 }: {
   detail: ThinkingActivityDetail;
+  onOpenNativeReview: () => void;
 }) {
   const [isOpen, setIsOpen] = useState(false);
+
+  if (detail.kind === "files") {
+    return (
+      <div className="ai-chat-thinking-detail">
+        <button
+          className="ai-chat-thinking-detail-trigger"
+          onClick={onOpenNativeReview}
+          type="button"
+        >
+          <span>在 Codex 中查看 diff</span>
+          <LinearIcon name="openExternal" />
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className={`ai-chat-thinking-detail${isOpen ? " is-open" : ""}`}>
@@ -702,11 +544,7 @@ function ThinkingStepDetail({
         <span>{detail.summary}</span>
         <LinearIcon name="chevronRight" />
       </button>
-      <div
-        aria-hidden={!isOpen}
-        className="ai-chat-thinking-detail-panel"
-        inert={!isOpen}
-      >
+      {isOpen && <div className="ai-chat-thinking-detail-panel">
         <div className="ai-chat-thinking-detail-panel-inner">
           {detail.kind === "lines" ? (
             <div className="ai-chat-thinking-detail-lines">
@@ -718,7 +556,7 @@ function ThinkingStepDetail({
             <pre><code>{detail.value}</code></pre>
           )}
         </div>
-      </div>
+      </div>}
     </div>
   );
 }
@@ -726,9 +564,11 @@ function ThinkingStepDetail({
 function ThinkingSteps({
   events,
   active,
+  onOpenNativeReview,
 }: {
   events: AiChatEvent[];
   active: boolean;
+  onOpenNativeReview: () => void;
 }) {
   const statuses = events.map(aiChatEventStatus);
   const status = statuses.includes("running")
@@ -767,8 +607,9 @@ function ThinkingSteps({
           <div className="ai-chat-thinking-list">
             {events.map((event, index) => {
               const eventStatus = aiChatEventStatus(event);
+              const isModelResumeWarning = isCodexModelResumeWarning(event);
               const detail = activityDetail(event);
-              const content = detail?.kind === "lines"
+              const content = detail?.kind === "files"
                 && (event.type === "file" || event.type === "file_change")
                 ? `${detail.value.length} 个文件`
                 : detail?.kind === "lines"
@@ -786,7 +627,13 @@ function ThinkingSteps({
                   <div className={`ai-chat-thinking-step is-${eventStatus}${index === events.length - 1 ? " is-last" : ""}`}>
                     <span className="ai-chat-thinking-step-rail" aria-hidden="true">
                       <span className="ai-chat-thinking-step-icon">
-                        <LinearIcon name={eventStatus === "failed" ? "alert" : ACTIVITY_ICONS[event.type] ?? "statusTodo"} />
+                        <LinearIcon name={
+                          eventStatus === "failed"
+                            ? "alert"
+                            : isModelResumeWarning
+                              ? "statusTodo"
+                              : ACTIVITY_ICONS[event.type] ?? "statusTodo"
+                        } />
                       </span>
                       {index !== events.length - 1 && (
                         <span className="ai-chat-thinking-step-connector" />
@@ -795,7 +642,9 @@ function ThinkingSteps({
                     <div className="ai-chat-thinking-step-content">
                       <div className="ai-chat-thinking-step-heading">
                         <span className="ai-chat-thinking-step-label">
-                          {ACTIVITY_LABELS[event.type] ?? "执行活动"}
+                          {isModelResumeWarning
+                            ? "模型提示"
+                            : ACTIVITY_LABELS[event.type] ?? "执行活动"}
                           {eventStatus === "running" && <span aria-hidden="true">…</span>}
                         </span>
                         {content && (
@@ -805,7 +654,7 @@ function ThinkingSteps({
                         )}
                       </div>
                       {detail && (
-                        <ThinkingStepDetail detail={detail} />
+                        <ThinkingStepDetail detail={detail} onOpenNativeReview={onOpenNativeReview} />
                       )}
                     </div>
                   </div>
@@ -852,17 +701,15 @@ function EventAttachments({ event }: { event: AiChatEvent }) {
 function MessageTimeline({
   activeRunId,
   events,
+  onOpenNativeReview,
   skills,
 }: {
   activeRunId: string | null;
   events: AiChatEvent[];
+  onOpenNativeReview: () => void;
   skills: AiChatSkill[];
 }) {
   const skillsById = new Map(skills.map((skill) => [skill.id, skill]));
-  const handleSkillFragmentCopy = (event: ReactClipboardEvent<HTMLElement>) => {
-    const fragment = selectedComposerFragment(event.currentTarget);
-    if (fragment) writeSkillFragmentToClipboard(event, fragment, skillsById);
-  };
   const timeline = filterVisibleAiEvents(events).reduce<Array<AiChatEvent | AiChatEvent[]>>(
     (items, event) => {
       const isMessage = event.role === "user"
@@ -893,6 +740,7 @@ function MessageTimeline({
                 && entry.some((event) => event.runId === activeRunId),
               )}
               events={entry}
+              onOpenNativeReview={onOpenNativeReview}
               key={`activity-${
                 typeof entry[0]?.data?.itemId === "string" && entry[0].data.itemId
                   ? entry[0].data.itemId
@@ -907,7 +755,6 @@ function MessageTimeline({
             <article
               className="ai-chat-user-message"
               key={event.id}
-              onCopy={handleSkillFragmentCopy}
             >
               <MarkdownMessage skillsById={skillsById}>
                 {skillMarkdown(event.content, eventSkillIds(event), skillsById)}
@@ -919,7 +766,7 @@ function MessageTimeline({
         if (event.role === "assistant" || event.type === "assistant" || event.type === "agent_message") {
           return (
             <article className="ai-chat-assistant-message" key={event.id}>
-              <MarkdownMessage>{event.content}</MarkdownMessage>
+              <MarkdownMessage onOpenNativeReview={onOpenNativeReview}>{event.content}</MarkdownMessage>
             </article>
           );
         }
@@ -943,8 +790,20 @@ function OptionMenu({
   );
 }
 
-export function AiChat({ available, projectId, issueId }: AiChatProps) {
-  const [panelOpen, setPanelOpen] = useState(false);
+export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
+  available,
+  projectId,
+  issueId,
+  issueIdentifier = null,
+  repositoryProjectId = null,
+  repositoryOptions,
+  repositoryLoading = false,
+  onRepositoryChange,
+  hideRepositoryPicker = false,
+  inline = false,
+  onOpenThread,
+}, ref) {
+  const [panelOpen, setPanelOpen] = useState(inline);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [menu, setMenu] = useState<MenuName>(null);
   const [threads, setThreads] = useState<AiChatThread[]>([]);
@@ -959,28 +818,27 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [skillIds, setSkillIds] = useState<string[]>([]);
   const [skillMention, setSkillMention] = useState<ComposerSkillQuery | null>(null);
   const [selectedSkillIndex, setSelectedSkillIndex] = useState(0);
   const [composerSkillTokens, setComposerSkillTokens] = useState<ComposerSkillToken[]>([]);
-  const [pendingDangerInput, setPendingDangerInput] = useState<PendingDangerInput | null>(null);
   const [unread, setUnread] = useState(false);
-  const [draftModel, setDraftModel] = useState("");
+  const [draftModel, setDraftModel] = useState(DEFAULT_AI_MODEL);
   const [draftEffort, setDraftEffort] = useState("");
-  const [draftSandbox, setDraftSandbox] = useState<AiChatSandbox>("workspace-write");
+  const [draftSandbox, setDraftSandbox] = useState<AiChatSandbox>(DEFAULT_AI_SANDBOX);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [deletingThreadId, setDeletingThreadId] = useState<string | null>(null);
-  const [attachmentDragActive, setAttachmentDragActive] = useState(false);
   const [panelGeometry, setPanelGeometry] = useState<PanelGeometry | null>(
     () => window.innerWidth <= 719 ? null : loadPanelGeometry(),
   );
   const [panelResizeEdge, setPanelResizeEdge] = useState<PanelResizeEdge | null>(null);
+  const singleIssueConversation = Boolean(issueIdentifier);
+  const repositorySelectionEnabled = Boolean(repositoryOptions && onRepositoryChange);
+  const effectiveProjectId = repositorySelectionEnabled ? repositoryProjectId : projectId;
   const editorRef = useRef<HTMLDivElement>(null);
   const skillMentionRangeRef = useRef<Range | null>(null);
   const composerBeforeInputRef = useRef<ComposerBeforeInput | null>(null);
   const skillMenuRef = useRef<HTMLDivElement>(null);
-  const attachmentInputRef = useRef<HTMLInputElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLElement>(null);
   const panelResizeSessionRef = useRef<PanelResizeSession | null>(null);
@@ -990,18 +848,63 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
   const snapshotRequestRef = useRef(0);
   const snapshotLoadingRequestRef = useRef(0);
   const observedRunStatusesRef = useRef(new Map<string, AiChatRun["status"]>());
-  const dangerConfirmOpen = pendingDangerInput !== null;
 
   const selectThread = useCallback((threadId: string | null) => {
     selectedThreadRef.current = threadId;
     setSelectedThreadId(threadId);
   }, []);
 
+  const openNativeThread = useCallback((thread: AiChatThread) => {
+    const codexThreadId = thread.codexThreadId;
+    if (!codexThreadId) {
+      setError(
+        thread.status === "running"
+          ? "原生 Codex 对话正在创建，请稍后再试"
+          : "当前对话尚未生成原生 Codex 线程，请先发送一条消息",
+      );
+      return;
+    }
+    setError(null);
+    if (onOpenThread) {
+      onOpenThread(codexThreadId, thread.title);
+      return;
+    }
+    if (window.parent !== window) {
+      window.parent.postMessage({
+        type: "taskboard:open-thread",
+        payload: { threadId: codexThreadId },
+      }, "*");
+      return;
+    }
+    window.location.assign(`codex://threads/${encodeURIComponent(codexThreadId)}`);
+  }, [onOpenThread]);
+
+  const openNativeReview = useCallback(() => {
+    const codexThreadId = snapshot?.thread.codexThreadId;
+    if (!codexThreadId) {
+      setError("当前对话尚未生成原生 Codex 任务，请先发送一条消息");
+      return;
+    }
+    if (window.parent !== window) {
+      window.parent.postMessage({
+        type: "taskboard:open-review",
+        payload: { threadId: codexThreadId },
+      }, "*");
+      return;
+    }
+    const query = new URLSearchParams({ view: "review", diffFilter: "last-turn" });
+    window.location.assign(`codex://threads/${encodeURIComponent(codexThreadId)}?${query}`);
+  }, [snapshot?.thread.codexThreadId]);
+
   useEffect(() => {
     selectedThreadRef.current = selectedThreadId;
     if (selectedThreadId) window.localStorage.setItem(LAST_THREAD_KEY, selectedThreadId);
     else window.localStorage.removeItem(LAST_THREAD_KEY);
   }, [selectedThreadId]);
+
+  useEffect(() => {
+    if (inline) setPanelOpen(true);
+  }, [inline]);
 
   useEffect(() => {
     panelOpenRef.current = panelOpen;
@@ -1175,19 +1078,30 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
 
   const loadThreads = useCallback(async () => {
     try {
-      const next = await listAiChatThreads();
-      setThreads(next);
+      const next = issueIdentifier
+        ? await listAiChatThreadsForIssueIdentifier(issueIdentifier)
+        : await listAiChatThreads();
+      const visibleThreads = singleIssueConversation
+        ? (repositorySelectionEnabled
+          ? (effectiveProjectId
+            ? next.filter((thread) => thread.origin.projectId === effectiveProjectId).slice(0, 1)
+            : [])
+          : next.slice(0, 1))
+        : next;
+      setThreads(visibleThreads);
       setSelectedThreadId((current) => {
-        const selected = current && next.some((thread) => thread.id === current)
-          ? current
-          : next[0]?.id ?? null;
+        const selected = singleIssueConversation
+          ? visibleThreads[0]?.id ?? null
+          : current && visibleThreads.some((thread) => thread.id === current)
+            ? current
+            : visibleThreads[0]?.id ?? null;
         selectedThreadRef.current = selected;
         return selected;
       });
     } catch (nextError) {
       setError(messageFor(nextError));
     }
-  }, []);
+  }, [effectiveProjectId, issueIdentifier, repositorySelectionEnabled, singleIssueConversation]);
 
   useEffect(() => {
     if (!available) {
@@ -1216,8 +1130,19 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
         else void selectedHintRefreshQueue.request(selectedThreadId);
       },
     );
+    const refreshNativeContinuation = () => {
+      if (document.visibilityState === "visible") {
+        void selectedHintRefreshQueue.request(selectedThreadId);
+      }
+    };
+    const nativeRefreshInterval = window.setInterval(refreshNativeContinuation, 15_000);
+    document.addEventListener("visibilitychange", refreshNativeContinuation);
+    window.addEventListener("focus", refreshNativeContinuation);
     return () => {
       disposed = true;
+      window.clearInterval(nativeRefreshInterval);
+      document.removeEventListener("visibilitychange", refreshNativeContinuation);
+      window.removeEventListener("focus", refreshNativeContinuation);
       unsubscribe();
     };
   }, [loadSnapshot, selectedHintRefreshQueue, selectedThreadId]);
@@ -1256,7 +1181,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
   const catalogProjectId = snapshot?.thread.origin.projectId
     ?? selectedThreadSummary?.origin.projectId
     ?? draftOrigin?.projectId
-    ?? projectId;
+    ?? effectiveProjectId;
   const activeCatalog = catalogLoadedProjectId === catalogProjectId ? catalog : null;
   useEffect(() => {
     if (!available || !catalogProjectId) {
@@ -1289,10 +1214,15 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
   }, [available, catalogProjectId]);
 
   const restoreDraftSettings = useCallback((thread: AiChatThread) => {
-    setDraftModel(thread.model);
-    setDraftEffort(thread.reasoningEffort);
+    const normalized = normalizeChatSelection(
+      activeCatalog?.models ?? [],
+      DEFAULT_AI_MODEL,
+      thread.reasoningEffort,
+    );
+    setDraftModel(normalized?.model ?? DEFAULT_AI_MODEL);
+    setDraftEffort(normalized?.reasoningEffort ?? thread.reasoningEffort);
     setDraftSandbox(thread.sandbox);
-  }, []);
+  }, [activeCatalog?.models]);
 
   useEffect(() => {
     const thread = snapshot?.thread;
@@ -1308,7 +1238,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
     const sandbox = draftOrigin && activeCatalog?.sandboxes.includes(draftSandbox)
       ? draftSandbox
       : activeCatalog?.sandboxes.find(
-          (candidate): candidate is AiChatSandbox => candidate === "workspace-write",
+          (candidate): candidate is AiChatSandbox => candidate === DEFAULT_AI_SANDBOX,
         ) ?? activeCatalog?.sandboxes.find(isAiChatSandbox);
     if (sandbox) setDraftSandbox(sandbox);
   }, [activeCatalog, draftOrigin, restoreDraftSettings, snapshot?.thread.id]);
@@ -1326,8 +1256,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
       event.preventDefault();
       event.stopPropagation();
       if (typeof event.stopImmediatePropagation === "function") event.stopImmediatePropagation();
-      if (dangerConfirmOpen) setPendingDangerInput(null);
-      else if (skillMention) setSkillMention(null);
+      if (skillMention) setSkillMention(null);
       else if (menu) setMenu(null);
       else if (historyOpen) setHistoryOpen(false);
       else {
@@ -1337,12 +1266,12 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
     }
     document.addEventListener("keydown", closeWithEscape, true);
     return () => document.removeEventListener("keydown", closeWithEscape, true);
-  }, [dangerConfirmOpen, draftOrigin, historyOpen, menu, panelOpen, skillMention, threads]);
+  }, [draftOrigin, historyOpen, menu, panelOpen, skillMention, threads]);
 
   const visibleSkills = useMemo(
     () => (activeCatalog?.skills ?? []).filter((skill) => (
-      skill.id !== "manage-taskboard"
-      && !skill.id.endsWith(":manage-taskboard")
+      skill.id !== "tomato-workboard"
+      && !skill.id.endsWith(":tomato-workboard")
       && (
         !skillMention?.query
         || skill.label.toLocaleLowerCase().includes(skillMention.query)
@@ -1353,25 +1282,26 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
     )),
     [activeCatalog?.skills, skillMention?.query],
   );
-  const selectedModel = activeCatalog?.models.find((model) => model.slug === draftModel) ?? null;
+  const selectedModel = activeCatalog?.models.find((model) => model.slug === DEFAULT_AI_MODEL)
+    ?? activeCatalog?.models[0]
+    ?? null;
   const availableSandboxes = (activeCatalog?.sandboxes ?? []).filter(isAiChatSandbox);
   const currentRun = snapshot?.thread.currentRun
     ?? snapshot?.runs.find((run) => run.status === "running")
     ?? null;
   const composerBlocked = Boolean(
-    selectedThreadId && deletingThreadId === selectedThreadId,
+    (repositorySelectionEnabled && !effectiveProjectId)
+    || (selectedThreadId && deletingThreadId === selectedThreadId),
   );
   const sendBlocked = loading
     || settingsSaving
     || composerBlocked
     || Boolean(selectedThreadId && !snapshot);
   const threadSettingsBlocked = loading || Boolean(selectedThreadId && !snapshot);
-  const attachmentBlocked = composerBlocked;
   const primaryAction = chatPrimaryAction(
     snapshot?.thread.status ?? "idle",
     draft,
     sendBlocked,
-    attachments.length > 0,
   );
   const anyRunning = threads.some((thread) => thread.status === "running");
   const anyFailed = threads.some((thread) => thread.status === "failed");
@@ -1404,20 +1334,12 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
     option?.scrollIntoView({ block: "nearest" });
   }, [selectedSkillIndex, skillMention?.query, visibleSkills.length]);
 
-  useEffect(() => {
-    if (attachmentBlocked) setAttachmentDragActive(false);
-  }, [attachmentBlocked]);
-
   function resetComposer() {
     editorRef.current?.replaceChildren();
-    if (attachmentInputRef.current) attachmentInputRef.current.value = "";
     setDraft("");
-    setAttachments([]);
     setSkillIds([]);
     setComposerSkillTokens([]);
     setSkillMention(null);
-    setPendingDangerInput(null);
-    setAttachmentDragActive(false);
     skillMentionRangeRef.current = null;
   }
 
@@ -1438,21 +1360,36 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
     if (
       !draftOrigin
       || (
-        draftOrigin.projectId === projectId
+        draftOrigin.projectId === effectiveProjectId
         && draftOrigin.issueId === (issueId ?? null)
       )
     ) return;
     restorePersistedConversationFromDraft();
-  }, [draftOrigin?.issueId, draftOrigin?.projectId, issueId, projectId]);
+  }, [draftOrigin?.issueId, draftOrigin?.projectId, effectiveProjectId, issueId]);
+
+  function changeRepository(nextProjectId: string) {
+    if (!onRepositoryChange || nextProjectId === repositoryProjectId) return;
+    draftReturnThreadIdRef.current = null;
+    setDraftOrigin(null);
+    setSnapshot(null);
+    selectThread(null);
+    resetComposer();
+    setHistoryOpen(false);
+    setError(null);
+    onRepositoryChange(nextProjectId);
+  }
 
   function beginNewConversation() {
-    const input = buildThreadCreateInput(projectId ?? "", issueId);
+    const input = buildThreadCreateInput(effectiveProjectId ?? "", issueId, projectId ?? "");
     if (!input) {
-      setError("请先进入一个已映射的项目，再新建对话");
+      setError(repositorySelectionEnabled ? "请先选择仓库，再新建对话" : "请先进入一个已映射的项目，再新建对话");
       return;
     }
     if (!draftOrigin) draftReturnThreadIdRef.current = selectedThreadRef.current;
     resetComposer();
+    setDraftModel(DEFAULT_AI_MODEL);
+    setDraftEffort("");
+    setDraftSandbox(DEFAULT_AI_SANDBOX);
     setDraftOrigin({
       projectId: input.projectId,
       issueId: input.issueId ?? null,
@@ -1466,15 +1403,18 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
 
   async function createThreadForDraftOrigin(): Promise<AiChatThread | null> {
     const origin = draftOrigin ?? (
-      projectId ? { projectId, issueId } : null
+      effectiveProjectId ? { projectId: effectiveProjectId, issueId } : null
     );
-    const input = buildThreadCreateInput(origin?.projectId ?? "", origin?.issueId ?? null);
+    const input = buildThreadCreateInput(
+      origin?.projectId ?? "",
+      origin?.issueId ?? null,
+      projectId ?? "",
+    );
     if (!input) {
-      setError("请先进入一个已映射的项目，再新建对话");
+      setError(repositorySelectionEnabled ? "请先选择仓库，再新建对话" : "请先进入一个已映射的项目，再新建对话");
       return null;
     }
     const inheritedSettings = {
-      model: draftModel,
       reasoningEffort: draftEffort,
       sandbox: draftSandbox,
     };
@@ -1485,16 +1425,15 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
         : await getAiChatCatalog(input.projectId);
       const normalized = normalizeChatSelection(
         targetCatalog.models,
-        inheritedSettings.model,
+        DEFAULT_AI_MODEL,
         inheritedSettings.reasoningEffort,
       );
       const sandbox = targetCatalog.sandboxes.includes(inheritedSettings.sandbox)
         ? inheritedSettings.sandbox
         : targetCatalog.sandboxes.find(
-          (candidate): candidate is AiChatSandbox => candidate === "workspace-write",
+          (candidate): candidate is AiChatSandbox => candidate === DEFAULT_AI_SANDBOX,
         ) ?? targetCatalog.sandboxes.find(isAiChatSandbox) ?? inheritedSettings.sandbox;
       const settings = {
-        model: normalized?.model ?? inheritedSettings.model,
         reasoningEffort: normalized?.reasoningEffort ?? inheritedSettings.reasoningEffort,
         sandbox,
       };
@@ -1540,7 +1479,6 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
   }
 
   async function saveThreadSettings(changes: {
-    model?: string;
     reasoningEffort?: string;
     sandbox?: AiChatSandbox;
   }) {
@@ -1561,17 +1499,6 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
     } finally {
       setSettingsSaving(false);
     }
-  }
-
-  async function chooseModel(model: AiChatModel) {
-    const reasoningEffort = reasoningEffortForModel(model, draftEffort);
-    setMenu(null);
-    setDraftModel(model.slug);
-    setDraftEffort(reasoningEffort);
-    await saveThreadSettings({
-      model: model.slug,
-      reasoningEffort,
-    });
   }
 
   async function chooseEffort(reasoningEffort: string) {
@@ -1737,46 +1664,27 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
 
   async function startMessage(
     message: string,
-    dangerConfirmed: boolean,
     boundSkillIds?: string[],
     clearSubmittedDraft = true,
-    boundAttachments?: AiChatAttachmentInput[],
   ) {
-    if (sendBlocked) return;
+    if (sendBlocked) return false;
     const trimmed = message.trim();
     const submittedSkillIds = boundSkillIds ?? [...realSkillIdsForMessage()];
-    const messageAttachments = boundAttachments ?? attachments.map((attachment) => ({
-      filename: attachment.filename,
-      contentType: attachment.contentType,
-      dataBase64: attachment.dataBase64,
-    }));
-    if (!trimmed && messageAttachments.length === 0) return;
+    if (!trimmed) return false;
     let thread = snapshot?.thread ?? null;
     const creatingThread = !thread;
-    const messageSandbox = thread?.sandbox ?? draftSandbox;
-    if (needsDangerConfirmation(messageSandbox, dangerConfirmed)) {
-      setPendingDangerInput({
-        message: trimmed,
-        skillIds: submittedSkillIds,
-        attachments: messageAttachments,
-        clearSubmittedDraft,
-      });
-      return;
-    }
     if (creatingThread && clearSubmittedDraft) resetComposer();
     if (!thread) thread = await createThreadForDraftOrigin();
-    if (!thread) return;
+    if (!thread) return false;
     const messageSkillIds = (
       boundSkillIds !== undefined || catalogLoadedProjectId === thread.origin.projectId
     ) ? submittedSkillIds : [];
-    setPendingDangerInput(null);
     setError(null);
     try {
       const turnInput = buildTurnInput(
         trimmed,
         messageSkillIds,
-        dangerConfirmed,
-        messageAttachments,
+        true,
       );
       if (clearSubmittedDraft && !creatingThread) {
         resetComposer();
@@ -1792,180 +1700,36 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
       if (selectedThreadRef.current === thread.id) {
         void selectedHintRefreshQueue.request(thread.id);
       }
+      return true;
     } catch (nextError) {
       if (selectedThreadRef.current === thread.id) setError(messageFor(nextError));
       if (selectedThreadRef.current === thread.id) {
         void selectedHintRefreshQueue.request(thread.id);
       }
+      return false;
     }
   }
 
-  function attachmentFiles(files: FileList | File[]): File[] {
-    return Array.from(files);
-  }
-
-  async function addAttachments(files: File[]) {
-    if (attachmentBlocked) return;
-    const acceptedFiles = attachmentFiles(files);
-    if (acceptedFiles.length === 0) return;
-    try {
-      const nextAttachments = await Promise.all(acceptedFiles.map((file, index) => (
-        new Promise<ComposerAttachment>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            if (typeof reader.result !== "string") {
-              reject(new Error(`无法读取附件 ${file.name}`));
-              return;
-            }
-            const separator = reader.result.indexOf(",");
-            resolve({
-              id: `${file.name}-${file.size}-${file.lastModified}-${Date.now()}-${index}`,
-              filename: file.name,
-              contentType: file.type || "application/octet-stream",
-              dataBase64: reader.result.slice(separator + 1),
-              ...(file.type.startsWith("image/") ? { previewUrl: reader.result } : {}),
-            });
-          };
-          reader.onerror = () => reject(new Error(`无法读取附件 ${file.name}`));
-          reader.readAsDataURL(file);
-        })
-      )));
-      setAttachments((current) => [...current, ...nextAttachments]);
+  useImperativeHandle(ref, () => ({
+    showThread(thread) {
+      setThreads((current) => [thread, ...current.filter((candidate) => candidate.id !== thread.id)]);
+      setSnapshot(null);
+      setDraftOrigin(null);
       setError(null);
-    } catch (nextError) {
-      setError(messageFor(nextError));
-    }
-  }
-
-  async function handleAttachmentSelection(event: ChangeEvent<HTMLInputElement>) {
-    const files = attachmentFiles(event.target.files ?? []);
-    event.target.value = "";
-    await addAttachments(files);
-  }
-
-  function hasDraggedFile(event: ReactDragEvent<HTMLDivElement>): boolean {
-    return Array.from(event.dataTransfer.items).some((item) => (
-      item.kind === "file"
-    )) || event.dataTransfer.files.length > 0;
-  }
-
-  function handleAttachmentDragEnter(event: ReactDragEvent<HTMLDivElement>) {
-    if (!hasDraggedFile(event)) return;
-    event.preventDefault();
-    if (attachmentBlocked) return;
-    setAttachmentDragActive(true);
-  }
-
-  function handleAttachmentDragOver(event: ReactDragEvent<HTMLDivElement>) {
-    if (!attachmentDragActive && !hasDraggedFile(event)) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = attachmentBlocked ? "none" : "copy";
-  }
-
-  function handleAttachmentDragLeave(event: ReactDragEvent<HTMLDivElement>) {
-    const nextTarget = event.relatedTarget;
-    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
-    setAttachmentDragActive(false);
-  }
-
-  function handleAttachmentDrop(event: ReactDragEvent<HTMLDivElement>) {
-    setAttachmentDragActive(false);
-    const files = attachmentFiles(event.dataTransfer.files);
-    if (files.length === 0) return;
-    event.preventDefault();
-    if (attachmentBlocked) return;
-    void addAttachments(files);
-  }
-
-  function handleComposerCopy(event: ReactClipboardEvent<HTMLDivElement>) {
-    const editor = editorRef.current;
-    if (!editor) return;
-    const fragment = selectedComposerFragment(editor);
-    if (!fragment) return;
-    const skillsById = new Map((activeCatalog?.skills ?? []).map((skill) => [skill.id, skill]));
-    writeSkillFragmentToClipboard(event, fragment, skillsById);
-  }
-
-  function handleComposerCut(event: ReactClipboardEvent<HTMLDivElement>) {
-    const editor = editorRef.current;
-    if (!editor) return;
-    const fragment = selectedComposerFragment(editor);
-    if (!fragment) return;
-    const skillsById = new Map((activeCatalog?.skills ?? []).map((skill) => [skill.id, skill]));
-    if (!writeSkillFragmentToClipboard(event, fragment, skillsById)) return;
-
-    const range = fragment.range;
-    range.deleteContents();
-    range.collapse(true);
-    const { startContainer, startOffset } = range;
-    let sentinel: Text | null = null;
-    let sentinelOffset = 0;
-    if (startContainer.nodeType === Node.TEXT_NODE) {
-      const text = startContainer as Text;
-      if (text.data[startOffset] === "\u200B") {
-        sentinel = text;
-        sentinelOffset = startOffset;
-      } else if (
-        startOffset === text.length
-        && text.nextSibling?.nodeType === Node.TEXT_NODE
-        && (text.nextSibling as Text).data.startsWith("\u200B")
-      ) {
-        sentinel = text.nextSibling as Text;
+      setPanelOpen(true);
+      selectThread(thread.id);
+    },
+    async startSkillAction({ message, skillId }) {
+      const skill = activeCatalog?.skills.find((candidate) => (
+        candidate.id === skillId || candidate.id.endsWith(`:${skillId}`)
+      ));
+      if (!skill) {
+        setError(catalogError || `未找到 ${skillId} skill`);
+        return false;
       }
-    } else if (
-      startContainer.nodeType === Node.ELEMENT_NODE
-      && startContainer.childNodes[startOffset]?.nodeType === Node.TEXT_NODE
-      && (startContainer.childNodes[startOffset] as Text).data.startsWith("\u200B")
-    ) {
-      sentinel = startContainer.childNodes[startOffset] as Text;
-    }
-    if (sentinel) {
-      sentinel.deleteData(sentinelOffset, 1);
-      if (!sentinel.data && sentinel !== startContainer) sentinel.remove();
-    }
-
-    syncComposerState();
-    const selection = editor.ownerDocument.getSelection();
-    selection?.removeAllRanges();
-    if (range.startContainer === editor || editor.contains(range.startContainer)) {
-      selection?.addRange(range);
-    } else {
-      const caret = editor.ownerDocument.createRange();
-      caret.selectNodeContents(editor);
-      caret.collapse(false);
-      selection?.addRange(caret);
-    }
-    setSkillMention(null);
-    skillMentionRangeRef.current = null;
-    editor.focus();
-  }
-
-  function handleComposerPaste(event: ReactClipboardEvent<HTMLDivElement>) {
-    if (attachmentBlocked) return;
-    const files = attachmentFiles(event.clipboardData.files);
-    event.preventDefault();
-    if (files.length > 0) {
-      void addAttachments(files);
-      return;
-    }
-    const skills = activeCatalog?.skills ?? [];
-    const skillsById = new Map(skills.map((skill) => [skill.id, skill]));
-    const internalFragment = parseAiChatComposerFragment(
-      event.clipboardData.getData(COMPOSER_FRAGMENT_MIME),
-      skillsById.keys(),
-    );
-    if (internalFragment && insertComposerFragment(internalFragment)) return;
-    const htmlFragment = composerFragmentFromHtml(
-      event.clipboardData.getData("text/html"),
-      skills,
-    );
-    if (htmlFragment && insertComposerFragment(htmlFragment)) return;
-    const clipboardText = event.clipboardData.getData("text/plain");
-    const plainFragment = composerFragmentFromPlainText(clipboardText, skills);
-    if (plainFragment && insertComposerFragment(plainFragment)) return;
-    const plainText = clipboardText.replaceAll(SKILL_MARKER, "\uFFFD");
-    if (plainText) insertComposerFragment({ message: plainText, skillIds: [] });
-  }
+      return startMessage(`${SKILL_MARKER} ${message}`, [skill.id], false);
+    },
+  }));
 
   async function stopRun(run: AiChatRun | null) {
     if (!run) return;
@@ -2011,7 +1775,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
     if (event.key === "Enter") {
       if (primaryAction === "stop") return;
       event.preventDefault();
-      if (primaryAction === "send") void startMessage(draft, false);
+      if (primaryAction === "send") void startMessage(draft);
     }
   }
 
@@ -2019,7 +1783,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
 
   return (
     <div
-      className={`ai-chat-root is-${launcherState}`}
+      className={`ai-chat-root is-${launcherState}${inline ? " is-inline" : ""}`}
       onPointerDown={(event) => {
         if (!(event.target as HTMLElement).closest(".ai-chat-menu-wrap")) setMenu(null);
       }}
@@ -2027,63 +1791,102 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
       {panelOpen && (
         <section
           ref={panelRef}
-          className={`ai-chat-panel${panelResizeEdge ? ` is-resizing-${panelResizeEdge}` : ""}`}
-          style={panelGeometry ?? undefined}
+          className={`ai-chat-panel${inline ? " is-inline" : ""}${panelResizeEdge ? ` is-resizing-${panelResizeEdge}` : ""}`}
+          style={inline ? undefined : panelGeometry ?? undefined}
           aria-label="Codex AI 对话"
           data-screen-label="Codex AI 对话"
         >
-          <div
-            className="ai-chat-resize-handle is-top"
-            aria-hidden="true"
-            onPointerDown={(event) => startPanelResize(event, "top")}
-          />
-          <div
-            className="ai-chat-resize-handle is-left"
-            aria-hidden="true"
-            onPointerDown={(event) => startPanelResize(event, "left")}
-          />
-          <div
-            className="ai-chat-resize-handle is-top-left"
-            aria-hidden="true"
-            onPointerDown={(event) => startPanelResize(event, "top-left")}
-          />
+          {!inline && (
+            <>
+              <div
+                className="ai-chat-resize-handle is-top"
+                aria-hidden="true"
+                onPointerDown={(event) => startPanelResize(event, "top")}
+              />
+              <div
+                className="ai-chat-resize-handle is-left"
+                aria-hidden="true"
+                onPointerDown={(event) => startPanelResize(event, "left")}
+              />
+              <div
+                className="ai-chat-resize-handle is-top-left"
+                aria-hidden="true"
+                onPointerDown={(event) => startPanelResize(event, "top-left")}
+              />
+            </>
+          )}
           <header className="ai-chat-panel-header">
-            <div className="ai-chat-panel-title">
-              <strong>{snapshot?.thread.title ?? "新对话"}</strong>
-              <span>{snapshot?.thread.origin.projectName ?? "选择对话或从当前项目新建"}</span>
-            </div>
             <button
+              className="ai-chat-panel-title"
               type="button"
-              aria-label="对话历史"
-              aria-pressed={historyOpen}
-              title="对话历史"
-              onClick={() => { setHistoryOpen((current) => !current); setMenu(null); }}
-            >
-              <LinearIcon name="conversation" />
-            </button>
-            <button
-              type="button"
-              aria-label="新建对话"
-              title={projectId ? "新建对话" : "请先进入项目"}
-              disabled={!projectId || loading}
-              onClick={beginNewConversation}
-            >
-              <LinearIcon name="plus" />
-            </button>
-            <button
-              type="button"
-              aria-label="关闭 AI 对话"
-              title="关闭"
+              disabled={!snapshot?.thread.codexThreadId}
+              title={snapshot?.thread.codexThreadId
+                ? "在 Codex 原生对话中继续"
+                : "发送第一条消息后可在 Codex 原生对话中继续"}
               onClick={() => {
-                restorePersistedConversationFromDraft();
-                setPanelOpen(false);
+                if (snapshot?.thread) openNativeThread(snapshot.thread);
               }}
             >
-              <LinearIcon name="close" />
+              <strong>{snapshot?.thread.title ?? "新对话"}</strong>
+              {!repositorySelectionEnabled && (
+                <span>{snapshot?.thread.codexThreadId
+                  ? snapshot.thread.origin.projectName
+                  : snapshot?.thread.origin.projectName ?? "选择对话或从当前项目新建"}</span>
+              )}
             </button>
+            {repositorySelectionEnabled && !hideRepositoryPicker && (
+              <label className="ai-chat-repository-picker">
+                <select
+                  aria-label="选择仓库"
+                  value={repositoryProjectId ?? ""}
+                  disabled={repositoryLoading || loading}
+                  onChange={(event) => changeRepository(event.currentTarget.value)}
+                >
+                  <option value="">选择仓库</option>
+                  {(repositoryOptions ?? []).map((option) => (
+                    <option key={option.id} value={option.id}>{option.name}</option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {!singleIssueConversation && (
+              <>
+                <button
+                  type="button"
+                  aria-label="对话历史"
+                  aria-pressed={historyOpen}
+                  title="对话历史"
+                  onClick={() => { setHistoryOpen((current) => !current); setMenu(null); }}
+                >
+                  <LinearIcon name="conversation" />
+                </button>
+                <button
+                  type="button"
+                  aria-label="新建对话"
+                  title={effectiveProjectId ? "新建对话" : "请先进入项目"}
+                  disabled={!effectiveProjectId || loading}
+                  onClick={beginNewConversation}
+                >
+                  <LinearIcon name="plus" />
+                </button>
+              </>
+            )}
+            {!inline && (
+              <button
+                type="button"
+                aria-label="关闭 AI 对话"
+                title="关闭"
+                onClick={() => {
+                  restorePersistedConversationFromDraft();
+                  setPanelOpen(false);
+                }}
+              >
+                <LinearIcon name="close" />
+              </button>
+            )}
           </header>
 
-          {historyOpen && (
+          {historyOpen && !singleIssueConversation && (
             <div className="ai-chat-history" aria-label="对话历史">
               <div className="ai-chat-history-heading">
                 <strong>对话历史</strong>
@@ -2096,7 +1899,12 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
                 >
                   <button
                     type="button"
+                    title={thread.codexThreadId ? "在 Codex 原生对话中打开" : "打开本地创建记录"}
                     onClick={() => {
+                      if (thread.codexThreadId) {
+                        openNativeThread(thread);
+                        return;
+                      }
                       if (thread.id !== selectedThreadRef.current) resetComposer();
                       draftReturnThreadIdRef.current = null;
                       setDraftOrigin(null);
@@ -2140,6 +1948,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
                 <MessageTimeline
                   activeRunId={currentRun?.id ?? null}
                   events={snapshot.events}
+                  onOpenNativeReview={openNativeReview}
                   skills={activeCatalog?.skills ?? []}
                 />
                 {snapshot.thread.status === "running" && (
@@ -2155,10 +1964,8 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
                     onClick={() => {
                       void startMessage(
                         retryableUserEvent.content,
-                        false,
                         eventSkillIds(retryableUserEvent),
                         false,
-                        [],
                       );
                     }}
                   >
@@ -2170,7 +1977,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
             ) : (
               <div className="ai-chat-empty">
                 <LinearIcon name="conversation" />
-                <strong>{projectId ? "在当前项目中开始对话" : "打开一个历史对话"}</strong>
+                <strong>{effectiveProjectId ? "在当前项目中开始对话" : "打开一个历史对话"}</strong>
                 <p>{projectId
                   ? "Codex 会在新对话创建时记住当前项目。"
                   : "进入项目后可以新建对话。"}</p>
@@ -2185,48 +1992,8 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
             </div>
           )}
 
-          <div
-            className={`ai-chat-composer${attachmentDragActive ? " is-attachment-drag-active" : ""}`}
-            onDragEnter={handleAttachmentDragEnter}
-            onDragOver={handleAttachmentDragOver}
-            onDragLeave={handleAttachmentDragLeave}
-            onDrop={handleAttachmentDrop}
-          >
-            {attachmentDragActive && (
-              <div className="ai-chat-attachment-drop-hint" aria-hidden="true">
-                松开添加文件
-              </div>
-            )}
+          <div className="ai-chat-composer">
             <div className="ai-chat-input-wrap">
-              {attachments.length > 0 && (
-                <div className="ai-chat-composer-attachments">
-                  {attachments.map((attachment) => (
-                    <div
-                      className={`ai-chat-composer-attachment${attachment.previewUrl ? "" : " is-file"}`}
-                      key={attachment.id}
-                    >
-                      {attachment.previewUrl
-                        ? <img src={attachment.previewUrl} alt="" />
-                        : (
-                          <span className="ai-chat-composer-file">
-                            <LinearIcon name="file" />
-                            <span>{attachment.filename}</span>
-                          </span>
-                        )}
-                      <button
-                        type="button"
-                        aria-label={`移除附件 ${attachment.filename}`}
-                        title="移除附件"
-                        onClick={() => {
-                          setAttachments((current) => current.filter((item) => item.id !== attachment.id));
-                        }}
-                      >
-                        <LinearIcon name="close" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
               <div
                 ref={editorRef}
                 className="ai-chat-composer-editor"
@@ -2266,9 +2033,6 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
                 }}
                 onCompositionEnd={() => updateComposerSkillQuery()}
                 onBlur={() => setSkillMention(null)}
-                onCopy={handleComposerCopy}
-                onCut={handleComposerCut}
-                onPaste={handleComposerPaste}
               />
               {composerSkillTokens.map((token) => {
                 const skill = activeCatalog?.skills.find((candidate) => candidate.id === token.id);
@@ -2316,24 +2080,6 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
             </div>
 
             <div className="ai-chat-composer-toolbar">
-              <input
-                ref={attachmentInputRef}
-                className="ai-chat-attachment-input"
-                type="file"
-                multiple
-                tabIndex={-1}
-                onChange={(event) => void handleAttachmentSelection(event)}
-              />
-              <button
-                className="ai-chat-attachment-button"
-                type="button"
-                aria-label="添加附件"
-                title="添加附件"
-                disabled={attachmentBlocked}
-                onClick={() => attachmentInputRef.current?.click()}
-              >
-                <LinearIcon name="plus" />
-              </button>
               <div className="ai-chat-menu-wrap ai-chat-permission-menu-wrap">
                 <button
                   className="ai-chat-permission-trigger"
@@ -2391,7 +2137,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
                   className="ai-chat-model-trigger"
                   type="button"
                   aria-haspopup="menu"
-                  aria-expanded={menu === "model" || menu === "model-list" || menu === "effort-list"}
+                  aria-expanded={menu === "model" || menu === "effort-list"}
                   disabled={
                     !activeCatalog
                     || snapshot?.thread.status === "running"
@@ -2399,7 +2145,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
                     || threadSettingsBlocked
                   }
                   onClick={() => setMenu((current) => (
-                    current === "model" || current === "model-list" || current === "effort-list"
+                    current === "model" || current === "effort-list"
                       ? null
                       : "model"
                   ))}
@@ -2412,40 +2158,11 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
                 </button>
                 {menu === "model" && (
                   <div className="ai-chat-option-menu ai-chat-config-menu" role="menu" aria-label="模型与推理强度">
-                    <button type="button" onClick={() => setMenu("model-list")}>
-                      <span>模型</span>
-                      <strong>{modelDisplayName(selectedModel?.displayName ?? draftModel)}</strong>
-                      <LinearIcon name="chevronRight" />
-                    </button>
                     <button type="button" onClick={() => setMenu("effort-list")}>
                       <span>推理强度</span>
                       <strong>{EFFORT_LABELS[draftEffort] ?? draftEffort}</strong>
                       <LinearIcon name="chevronRight" />
                     </button>
-                  </div>
-                )}
-                {menu === "model-list" && (
-                  <div className="ai-chat-option-menu ai-chat-config-menu ai-chat-config-submenu ai-chat-model-list" role="menu" aria-label="选择模型">
-                    <header>
-                      <button type="button" aria-label="返回模型与推理强度" onClick={() => setMenu("model")}>
-                        <LinearIcon name="chevronLeft" />
-                      </button>
-                      <strong>模型</strong>
-                    </header>
-                    {(activeCatalog?.models ?? []).map((model) => (
-                      <button
-                        type="button"
-                        role="menuitemradio"
-                        aria-checked={model.slug === draftModel}
-                        key={model.slug}
-                        onClick={() => void chooseModel(model)}
-                      >
-                        <span>
-                          <strong>{modelDisplayName(model.displayName)}</strong>
-                        </span>
-                        {model.slug === draftModel && <LinearIcon name="check" />}
-                      </button>
-                    ))}
                   </div>
                 )}
                 {menu === "effort-list" && selectedModel && (
@@ -2494,7 +2211,7 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
                     || settingsSaving
                     || Boolean(catalogError)
                   }
-                  onClick={() => void startMessage(draft, false)}
+                  onClick={() => void startMessage(draft)}
                 >
                   <LinearIcon name="send" />
                 </button>
@@ -2502,37 +2219,10 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
             </div>
           </div>
 
-          {dangerConfirmOpen && (
-            <div className="ai-chat-confirm-backdrop">
-              <div className="ai-chat-confirm" role="alertdialog" aria-modal="true" aria-labelledby="ai-chat-confirm-title">
-                <strong id="ai-chat-confirm-title">允许完全访问？</strong>
-                <p>本次消息允许 Codex 访问工作区之外的文件和命令。确认只对本次发送生效。</p>
-                <div>
-                  <button type="button" onClick={() => setPendingDangerInput(null)}>取消</button>
-                  <button
-                    className="is-danger"
-                    type="button"
-                    onClick={() => {
-                      if (!pendingDangerInput) return;
-                      void startMessage(
-                        pendingDangerInput.message,
-                        true,
-                        pendingDangerInput.skillIds,
-                        pendingDangerInput.clearSubmittedDraft,
-                        pendingDangerInput.attachments,
-                      );
-                    }}
-                  >
-                    允许并发送
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
         </section>
       )}
 
-      {!panelOpen && (
+      {!inline && !panelOpen && (
         <button
           type="button"
           className={`ai-chat-launcher is-${launcherState}`}
@@ -2547,4 +2237,4 @@ export function AiChat({ available, projectId, issueId }: AiChatProps) {
       )}
     </div>
   );
-}
+});

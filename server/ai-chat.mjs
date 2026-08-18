@@ -1,17 +1,27 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
-import { ApiError } from "./database.mjs";
-import { discoverAiCatalog, resolveAiWorkspace } from "./ai-chat-catalog.mjs";
+import { ApiError, tomatoItemKey } from "./database.mjs";
+import {
+  discoverAiCatalog,
+  readCodexThreadMessages,
+  readCodexThreadModel,
+  resolveAiWorkspace,
+  setCodexThreadName,
+} from "./ai-chat-catalog.mjs";
 import {
   buildCodexArgs,
   buildCodexPrompt,
   normalizeCodexEvent,
+  spawnCodexAppServerTurn,
   spawnCodexTurn,
 } from "./ai-chat-process.mjs";
 
 const SANDBOXES = new Set(["read-only", "workspace-write", "danger-full-access"]);
+const DEFAULT_AI_MODEL = "gpt-5.6-luna";
 const ERROR_CONTENT_LIMIT = 65_536;
 const CODEX_IMAGE_TYPES = new Set([
   "image/gif",
@@ -19,10 +29,32 @@ const CODEX_IMAGE_TYPES = new Set([
   "image/png",
   "image/webp",
 ]);
+const execFileAsync = promisify(execFile);
+
+async function readGitBranch(workspacePath) {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", workspacePath, "branch", "--show-current"],
+      { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024 },
+    );
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
 
 function cappedError(value) {
   const message = value instanceof Error ? value.message : String(value ?? "");
   return message.slice(0, ERROR_CONTENT_LIMIT);
+}
+
+function conversationTitle(issue, issueIdentifier) {
+  if (issue?.projectId !== "tomato" || !issueIdentifier) {
+    return issueIdentifier ?? "New conversation";
+  }
+  const title = issue.title.replace(/^\[[^\]]+\]\s*/u, "").trim();
+  return `${issueIdentifier} ${title}`.trim();
 }
 
 function signalProcessGroup(child, signal) {
@@ -49,16 +81,21 @@ export class AiChatService {
     this.database = options.database;
     this.codexExecutable = options.codexExecutable;
     this.codexStatePath = options.codexStatePath;
-    this.manageTaskboardSkillPath = options.manageTaskboardSkillPath;
+    this.fallbackWorkspacePath = options.fallbackWorkspacePath ?? null;
+    this.tomatoWorkboardSkillPath = options.tomatoWorkboardSkillPath;
     this.processEnv = options.processEnv ?? process.env;
     this.killGraceMs = options.killGraceMs ?? 1_000;
+    this.readGitBranch = options.readGitBranch ?? readGitBranch;
+    this.readCodexThreadModel = options.readCodexThreadModel ?? readCodexThreadModel;
+    this.readCodexThreadMessages = options.readCodexThreadMessages ?? readCodexThreadMessages;
+    this.setCodexThreadName = options.setCodexThreadName ?? setCodexThreadName;
     this.active = new Map();
     this.listeners = new Map();
     this.completions = new Map();
   }
 
-  listThreads() {
-    return this.database.listAiChatThreads();
+  listThreads(filter) {
+    return this.database.listAiChatThreads(filter);
   }
 
   getThread(threadId) {
@@ -73,6 +110,73 @@ export class AiChatService {
     return thread;
   }
 
+  async syncNativeThreadName(codexThreadId) {
+    let thread = this.database.listAiChatThreads()
+      .find((candidate) => candidate.codexThreadId === codexThreadId);
+    if (!thread) return null;
+    thread = await this.#syncTomatoThreadName(thread);
+    if (thread) await this.#setNativeThreadName(thread);
+    return thread.title;
+  }
+
+  async repairTomatoThreadNames() {
+    const tasks = this.database.listTasks({ projectId: "tomato" });
+    const tasksByKey = new Map(
+      tasks.flatMap((task) => {
+        const key = tomatoItemKey(task.description);
+        return key ? [[key, task]] : [];
+      }),
+    );
+    const threads = this.database.listAiChatThreads({ projectId: "tomato" });
+    let updated = 0;
+    let nativeUpdated = 0;
+    for (const thread of threads) {
+      const task = thread.origin.issueId
+        ? this.database.getTask(thread.origin.issueId)
+        : tasksByKey.get(thread.origin.issueIdentifier);
+      const repaired = await this.#syncTomatoThreadName(thread, task);
+      if (!repaired) continue;
+      if (repaired.title !== thread.title || repaired.origin.issueIdentifier !== thread.origin.issueIdentifier) {
+        updated += 1;
+      }
+      if (repaired.codexThreadId) {
+        try {
+          await this.#setNativeThreadName(repaired);
+          nativeUpdated += 1;
+        } catch {
+          // A stale or unavailable native thread should not block other repairs.
+        }
+      }
+    }
+    return { total: threads.length, updated, nativeUpdated };
+  }
+
+  async #syncTomatoThreadName(thread, task = null) {
+    const issue = task ?? (
+      thread.origin.issueId ? this.database.getTask(thread.origin.issueId) : null
+    );
+    if (issue?.projectId !== "tomato" && thread.origin.projectId !== "tomato") return thread;
+    const itemKey = tomatoItemKey(issue?.description) || thread.origin.issueIdentifier;
+    if (!itemKey) return thread;
+    const title = issue ? conversationTitle(issue, itemKey) : thread.title;
+    const changes = {};
+    if (title !== thread.title) changes.title = title;
+    if (thread.origin.issueIdentifier !== itemKey) changes.originIssueIdentifier = itemKey;
+    return Object.keys(changes).length > 0
+      ? this.database.updateAiChatThread(thread.id, changes)
+      : thread;
+  }
+
+  async #setNativeThreadName(thread) {
+    await this.setCodexThreadName({
+      codexExecutable: this.codexExecutable,
+      workspacePath: thread.origin.workspacePath,
+      processEnv: this.processEnv,
+      threadId: thread.codexThreadId,
+      name: thread.title,
+    });
+  }
+
   getThreadSnapshot(threadId) {
     const thread = this.getThread(threadId);
     return {
@@ -80,6 +184,41 @@ export class AiChatService {
       events: this.database.listAiChatEvents(threadId),
       runs: this.database.listAiChatRuns(threadId),
     };
+  }
+
+  async syncNativeThread(threadId) {
+    const thread = this.getThread(threadId);
+    if (!thread.codexThreadId) return 0;
+    const [nativeMessages, existingEvents] = await Promise.all([
+      this.readCodexThreadMessages(this.codexStatePath, thread.codexThreadId),
+      Promise.resolve(this.database.listAiChatEvents(threadId)),
+    ]);
+    const existing = new Map();
+    for (const event of existingEvents) {
+      const key = `${event.role}\0${event.content}`;
+      existing.set(key, (existing.get(key) ?? 0) + 1);
+    }
+    let inserted = 0;
+    for (const message of nativeMessages) {
+      const key = `${message.role}\0${message.content}`;
+      const remainingMatches = existing.get(key) ?? 0;
+      if (remainingMatches > 0) {
+        existing.set(key, remainingMatches - 1);
+        continue;
+      }
+      const event = this.database.insertAiChatEvent({
+        id: message.id ? `native:${message.id}` : undefined,
+        threadId,
+        type: message.role === "user" ? "user_message" : "agent_message",
+        role: message.role,
+        content: message.content,
+        data: { source: "codex-native" },
+        createdAt: message.createdAt ?? undefined,
+      });
+      inserted += 1;
+      this.#emit(threadId, { type: "ai.event", event });
+    }
+    return inserted;
   }
 
   getRun(runId) {
@@ -110,58 +249,89 @@ export class AiChatService {
       database: this.database,
       projectId,
       processEnv: this.processEnv,
+      fallbackWorkspacePath: this.fallbackWorkspacePath,
     });
   }
 
   async createThread(input) {
     const [catalog, resolved] = await Promise.all([
       this.getCatalog(input.projectId),
-      resolveAiWorkspace(input.projectId, this.codexStatePath, this.database),
+      resolveAiWorkspace(
+        input.projectId,
+        this.codexStatePath,
+        this.database,
+        this.fallbackWorkspacePath,
+      ),
     ]);
-    const model = this.#resolveModel(catalog, input.model);
+    const model = this.#resolveModel(catalog);
     const reasoningEffort = input.reasoningEffort ?? model.defaultReasoningEffort;
     this.#validateReasoningEffort(model, reasoningEffort);
-    const sandbox = input.sandbox ?? "workspace-write";
+    const sandbox = input.sandbox ?? "danger-full-access";
     this.#validateSandbox(sandbox);
 
     let issue;
+    const issueProjectId = input.issueProjectId ?? input.projectId;
     if (input.issueId !== undefined) {
       issue = this.database.getTask(input.issueId);
-      if (!issue || issue.projectId !== input.projectId || issue.archivedAt != null) {
+      if (!issue || issue.projectId !== issueProjectId || issue.archivedAt != null) {
         throw new ApiError(
           404,
           "AI_CHAT_ISSUE_NOT_FOUND",
-          `Task '${input.issueId}' is not an active task in project '${input.projectId}'`,
+          `Task '${input.issueId}' is not an active task in project '${issueProjectId}'`,
         );
       }
     }
 
-    return this.database.createAiChatThread({
-      title: input.title ?? issue?.identifier ?? "New conversation",
-      origin: {
-        projectId: resolved.project.id,
-        projectName: resolved.project.name,
-        workspacePath: resolved.workspacePath,
-        ...(issue ? { issueId: issue.id, issueIdentifier: issue.identifier } : {}),
-      },
-      model: model.slug,
-      reasoningEffort,
-      sandbox,
-    });
+    const issueIdentifier = issue?.projectId === "tomato"
+      ? tomatoItemKey(issue.description) || issue.identifier
+      : issue?.identifier;
+
+    if (issueIdentifier) {
+      const existing = this.database.listAiChatThreads({ issueIdentifier })
+        .find((thread) => thread.origin.projectId === resolved.project.id);
+      if (existing) return existing;
+    }
+
+    const gitBranch = await this.readGitBranch(resolved.workspacePath);
+    const threadId = issue?.projectId === "tomato"
+      && resolved.project.id === "tomato"
+      && issueIdentifier
+      ? `tomato:${issueIdentifier}`
+      : undefined;
+    const defaultTitle = conversationTitle(issue, issueIdentifier);
+    try {
+      return this.database.createAiChatThread({
+        ...(threadId ? { id: threadId } : {}),
+        title: input.title ?? defaultTitle,
+        origin: {
+          projectId: resolved.project.id,
+          projectName: resolved.project.name,
+          workspacePath: resolved.workspacePath,
+          ...(issue ? { issueId: issue.id, issueIdentifier } : {}),
+        },
+        gitBranch,
+        reasoningEffort,
+        sandbox,
+      });
+    } catch (error) {
+      const concurrentlyCreated = threadId ? this.database.getAiChatThread(threadId) : null;
+      if (concurrentlyCreated) return concurrentlyCreated;
+      throw error;
+    }
   }
 
   async updateThread(threadId, changes) {
     let thread = this.getThread(threadId);
-    const changesSettings = ["model", "reasoningEffort", "sandbox"].some(
+    const changesSettings = ["reasoningEffort", "sandbox"].some(
       (key) => Object.hasOwn(changes, key),
     );
     const wasActive = changesSettings && this.#threadIsActive(thread);
 
     if (Object.hasOwn(changes, "sandbox")) this.#validateSandbox(changes.sandbox);
-    if (Object.hasOwn(changes, "model") || Object.hasOwn(changes, "reasoningEffort")) {
+    if (Object.hasOwn(changes, "reasoningEffort")) {
       const catalog = await this.getCatalog(thread.origin.projectId);
       thread = this.getThread(threadId);
-      const model = this.#resolveModel(catalog, changes.model ?? thread.model);
+      const model = this.#resolveModel(catalog);
       const reasoningEffort = changes.reasoningEffort ?? thread.reasoningEffort;
       this.#validateReasoningEffort(model, reasoningEffort);
     }
@@ -208,7 +378,12 @@ export class AiChatService {
 
     const [catalog, resolved] = await Promise.all([
       this.getCatalog(thread.origin.projectId),
-      resolveAiWorkspace(thread.origin.projectId, this.codexStatePath, this.database),
+      resolveAiWorkspace(
+        thread.origin.projectId,
+        this.codexStatePath,
+        this.database,
+        this.fallbackWorkspacePath,
+      ),
     ]);
 
     thread = this.getThread(threadId);
@@ -226,8 +401,24 @@ export class AiChatService {
         "danger-full-access must be confirmed for every turn",
       );
     }
-    const model = this.#resolveModel(catalog, thread.model);
-    this.#validateReasoningEffort(model, thread.reasoningEffort);
+    const recordedModelSlug = thread.codexThreadId
+      ? await this.readCodexThreadModel(this.codexStatePath, thread.codexThreadId)
+      : null;
+    const recordedModel = recordedModelSlug
+      ? catalog.models.find((candidate) => candidate.slug === recordedModelSlug)
+      : null;
+    const model = recordedModel ?? this.#resolveModel(catalog);
+    const reasoningEffort = model.supportedReasoningEfforts.includes(thread.reasoningEffort)
+      ? thread.reasoningEffort
+      : model.defaultReasoningEffort;
+    this.#validateReasoningEffort(model, reasoningEffort);
+    const migrationChanges = {};
+    if (thread.reasoningEffort !== reasoningEffort) {
+      migrationChanges.reasoningEffort = reasoningEffort;
+    }
+    if (Object.keys(migrationChanges).length > 0) {
+      thread = this.database.updateAiChatThread(threadId, migrationChanges);
+    }
     if (resolved.workspacePath !== thread.origin.workspacePath) {
       throw new ApiError(
         409,
@@ -235,11 +426,12 @@ export class AiChatService {
         "The project's device workspace no longer matches this conversation",
       );
     }
+    const startingBranch = await this.readGitBranch(thread.origin.workspacePath);
 
     const skillIds = input.skillIds ?? [];
     const availableSkills = new Map(
       catalog.skills
-        .filter((skill) => skill.id !== "manage-taskboard")
+        .filter((skill) => skill.id !== "tomato-workboard")
         .map((skill) => [skill.id, skill]),
     );
     for (const skillId of skillIds) {
@@ -256,7 +448,14 @@ export class AiChatService {
       imagePaths,
     } = await this.#writeTurnAttachments(attachments);
     try {
-      const args = buildCodexArgs(thread, resolved.addDirectories, imagePaths);
+      const args = thread.codexThreadId
+        ? buildCodexArgs(
+          thread,
+          resolved.addDirectories,
+          imagePaths,
+          model.slug,
+        )
+        : null;
       const prompt = buildCodexPrompt(
         thread,
         {
@@ -264,7 +463,6 @@ export class AiChatService {
           skills: selectedSkills,
           attachmentPaths,
         },
-        this.manageTaskboardSkillPath,
       );
       const run = this.database.createAiChatRun({ threadId });
       this.#emit(threadId, { type: "ai.run", run });
@@ -291,12 +489,13 @@ export class AiChatService {
       let startedThreadId = null;
       let terminalOutcome = null;
       let terminalError = "";
-      const { child, completion } = spawnCodexTurn({
-        executable: this.codexExecutable,
-        args,
-        prompt,
-        env: this.processEnv,
-        onRawEvent: (raw) => {
+      const { child, completion } = thread.codexThreadId
+        ? spawnCodexTurn({
+          executable: this.codexExecutable,
+          args,
+          prompt,
+          env: this.processEnv,
+          onRawEvent: (raw) => {
           const normalized = normalizeCodexEvent(raw);
           if (!normalized) return;
           if (normalized.kind === "thread.started") {
@@ -325,10 +524,46 @@ export class AiChatService {
             terminalError ||= normalized.content;
           }
           this.#emit(threadId, { type: "ai.event", event });
-        },
-      });
+          },
+        })
+        : spawnCodexAppServerTurn({
+          executable: this.codexExecutable,
+          thread,
+          addDirectories: resolved.addDirectories,
+          imagePaths,
+          prompt,
+          model: model.slug,
+          env: this.processEnv,
+          onRawEvent: (raw) => {
+            const normalized = normalizeCodexEvent(raw);
+            if (!normalized) return;
+            if (normalized.kind === "thread.started") {
+              if (startedThreadId && normalized.threadId !== startedThreadId) {
+                throw new Error("Codex returned an unexpected thread id");
+              }
+              startedThreadId = normalized.threadId;
+              this.database.updateAiChatThread(threadId, { codexThreadId: normalized.threadId });
+              return;
+            }
+            const event = this.database.insertAiChatEvent({
+              threadId,
+              runId: run.id,
+              type: normalized.type,
+              role: normalized.role,
+              content: normalized.content,
+              data: normalized.data,
+            });
+            if (raw.type === "turn.completed" && terminalOutcome === null) {
+              terminalOutcome = "completed";
+            } else if (raw.type === "turn.failed" || raw.type === "error") {
+              terminalOutcome = "failed";
+              terminalError ||= normalized.content;
+            }
+            this.#emit(threadId, { type: "ai.event", event });
+          },
+        });
 
-      const active = { child, threadId, interrupted: false, temporaryDirectory };
+      const active = { child, threadId, interrupted: false, temporaryDirectory, startingBranch };
       this.active.set(run.id, active);
       const finalization = completion.then(
         (result) => this.#finishRun({
@@ -411,17 +646,14 @@ export class AiChatService {
     this.listeners.clear();
   }
 
-  #resolveModel(catalog, requestedModel) {
-    const model = requestedModel === undefined
-      ? catalog.models[0]
-      : catalog.models.find((candidate) => candidate.slug === requestedModel);
+  #resolveModel(catalog) {
+    const model = catalog.models.find((candidate) => candidate.slug === DEFAULT_AI_MODEL)
+      ?? catalog.models[0];
     if (!model) {
       throw new ApiError(
         400,
         "INVALID_MODEL",
-        requestedModel === undefined
-          ? "Codex did not provide an available model"
-          : `Unknown model '${requestedModel}'`,
+        "Codex did not provide an available model",
       );
     }
     return model;
@@ -564,6 +796,14 @@ export class AiChatService {
         error: publicError === null ? null : cappedError(publicError),
         finishedAt: new Date().toISOString(),
       });
+      const thread = this.database.getAiChatThread(run.threadId);
+      const finalBranch = await this.readGitBranch(thread.origin.workspacePath);
+      if (finalBranch && (!thread.gitBranch || finalBranch !== active.startingBranch)) {
+        this.database.updateAiChatThread(run.threadId, { gitBranch: finalBranch });
+      }
+      if (thread.codexThreadId) {
+        await this.syncNativeThreadName(thread.codexThreadId).catch(() => {});
+      }
       this.#emit(run.threadId, { type: "ai.run", run: updated });
       return updated;
     } finally {

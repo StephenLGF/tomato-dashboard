@@ -1,7 +1,6 @@
-const HOST_REQUEST_ERROR = "自动认领配置暂时无法应用，请刷新后重试";
-const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
+const HOST_REQUEST_ERROR = "Codex 宿主请求无效，请刷新后重试";
 
-function parseHostRequest(payload, parseAutomationRequest) {
+function parseHostRequest(payload) {
   if (typeof payload !== "string" || payload.length > 4_096) {
     return { id: null, request: null, error: HOST_REQUEST_ERROR };
   }
@@ -20,17 +19,6 @@ function parseHostRequest(payload, parseAutomationRequest) {
   ) ? request.id : null;
   if (!id) return { id: null, request: null, error: HOST_REQUEST_ERROR };
   if (request.action === "ensure") return { id, request, error: null };
-  if (request.action === "automation") {
-    const parsed = parseAutomationRequest(request);
-    return parsed
-      ? { id, request: parsed, error: null }
-      : {
-          id,
-          request: null,
-          error: HOST_REQUEST_ERROR,
-          diagnosticCode: AUTOMATION_SCHEMA_DIAGNOSTIC,
-        };
-  }
   if (
     request.action === "prefill-task-composer"
     && typeof request.instruction === "string"
@@ -51,14 +39,13 @@ function parseHostRequest(payload, parseAutomationRequest) {
 }
 
 export async function handleHostBindingPayload(params, handlers) {
-  const parsed = parseHostRequest(params.payload, handlers.parseAutomationRequest);
+  const parsed = parseHostRequest(params.payload);
   if (!parsed.request) {
     if (!parsed.id) return { responded: false, accepted: false };
     await handlers.sendResponse(params.executionContextId, {
       id: parsed.id,
       ok: false,
       error: parsed.error,
-      ...(parsed.diagnosticCode ? { diagnosticCode: parsed.diagnosticCode } : {}),
     });
     return { responded: true, accepted: false };
   }
@@ -67,8 +54,6 @@ export async function handleHostBindingPayload(params, handlers) {
     let result;
     if (parsed.request.action === "ensure") {
       result = await handlers.ensure();
-    } else if (parsed.request.action === "automation") {
-      result = await handlers.runAutomation(parsed.request, params.executionContextId);
     } else {
       result = await handlers.prefill(parsed.request, params.executionContextId);
     }
@@ -153,6 +138,37 @@ export async function restartResidentInjector(port, handlers) {
     pid: started.pid,
     restarted: true,
   };
+}
+
+export async function pruneStaleHostConnections(
+  connections,
+  publishHeartbeat,
+  timeoutMs,
+) {
+  const staleIds = [];
+  for (const [id, connection] of connections) {
+    let timeoutId;
+    try {
+      await Promise.race([
+        publishHeartbeat(connection),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error("Taskboard host heartbeat timed out")),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } catch (_) {
+      try {
+        connection.close();
+      } catch (_) {}
+      connections.delete(id);
+      staleIds.push(id);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+  return staleIds;
 }
 
 function commandPort(command, defaultPort) {

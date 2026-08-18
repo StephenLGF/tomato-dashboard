@@ -19,12 +19,28 @@ interface TaskCardProps {
   isMoving: boolean;
   isSettling: boolean;
   isContextMenuOpen: boolean;
+  readOnly?: boolean;
   onEdit: (task: Task) => void;
   onContextMenu: (task: Task, position: { x: number; y: number }) => void;
   onMove: (task: Task, status: TaskStatus) => void;
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
   onOpenThread: (threadId: string) => void;
+  onToggleTomatoAnalysis?: (task: Task) => void;
+  externalUrl?: string | null;
+  onExternalLinkFallback?: (url: string) => void;
+  displayIdentifier?: string;
+  displayTitle?: string;
+  hideAssignee?: boolean;
+  compactProperties?: {
+    itemType: string;
+    creatorName: string;
+    developmentBranches: Array<{ repository: string; branch: string }>;
+    hasConversation: boolean;
+    conversationActive: boolean;
+    threadId: string | null;
+    tomatoAnalysis?: Task["tomatoAnalysis"];
+  };
 }
 
 export function TaskCard({
@@ -35,13 +51,23 @@ export function TaskCard({
   isMoving,
   isSettling,
   isContextMenuOpen,
+  readOnly = false,
   onEdit,
   onContextMenu,
   onMove,
   onDragStart,
   onDragEnd,
   onOpenThread,
+  onToggleTomatoAnalysis,
+  externalUrl = null,
+  onExternalLinkFallback,
+  displayIdentifier,
+  displayTitle,
+  hideAssignee = false,
+  compactProperties,
 }: TaskCardProps) {
+  const cardIdentifier = displayIdentifier ?? task.identifier;
+  const cardTitle = displayTitle ?? task.title;
   const dueDate = task.dueDate
     ? new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric" }).format(new Date(`${task.dueDate}T12:00:00`))
     : null;
@@ -50,6 +76,7 @@ export function TaskCard({
   const activeBlockers = task.relations.blockedBy.filter((issue) => (
     issue.status !== "done" && issue.status !== "canceled"
   )).length;
+  const relatedIssueCount = task.relations.related.length;
 
   function stopThen(callback: () => void) {
     return (event: MouseEvent<HTMLButtonElement>) => {
@@ -58,20 +85,33 @@ export function TaskCard({
     };
   }
 
+  function openExternal(event: MouseEvent<HTMLAnchorElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!externalUrl) return;
+    const opened = window.open(externalUrl, "_blank", "noopener,noreferrer");
+    if (!opened) onExternalLinkFallback?.(externalUrl);
+  }
+
   return (
     <article
-      className={`task-card priority-${task.priority}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}`}
+      className={`task-card priority-${task.priority}${task.tomatoAnalysisDisabled ? " tomato-analysis-paused" : compactProperties?.tomatoAnalysis ? ` tomato-analysis-${compactProperties.tomatoAnalysis.status}` : ""}${compactProperties?.conversationActive ? " is-conversation-active" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}`}
       style={dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : undefined}
-      draggable={!isMoving}
+      draggable={!isMoving && !readOnly}
       aria-labelledby={`task-${task.id}-title`}
       data-task-id={task.id}
       data-drag-shift={dragShift || undefined}
       onContextMenu={(event) => {
+        if (readOnly) return;
         event.preventDefault();
         event.stopPropagation();
         onContextMenu(task, { x: event.clientX, y: event.clientY });
       }}
       onDragStart={(event) => {
+        if (readOnly) {
+          event.preventDefault();
+          return;
+        }
         event.dataTransfer.effectAllowed = "move";
         event.dataTransfer.setData("text/plain", task.id);
         event.dataTransfer.setData("application/x-taskboard-task", task.id);
@@ -82,13 +122,13 @@ export function TaskCard({
       <button
         className="task-card-open"
         type="button"
-        aria-label={`打开 ${task.identifier}: ${task.title}`}
+        aria-label={`打开 ${cardIdentifier}: ${cardTitle}`}
         onClick={() => onEdit(task)}
       />
 
       <div className="card-topline">
         <span className="card-reference">
-          <span className="task-identifier">{task.identifier}</span>
+          <span className="task-identifier">{cardIdentifier}</span>
           {task.relations.parent && (
             <>
               <LinearIcon name="chevronRight" />
@@ -98,8 +138,32 @@ export function TaskCard({
             </>
           )}
         </span>
-        <ActorAvatar actor={task.assignee} className="card-assignee-avatar" />
-        <div className="card-actions" aria-label="移动议题">
+        {!hideAssignee && <ActorAvatar actor={task.assignee} className="card-assignee-avatar" />}
+        {externalUrl && (
+          <a
+            className="card-external-link"
+            href={externalUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label={`在浏览器打开 ${task.title}`}
+            title="在浏览器打开番茄卡片"
+            onClick={openExternal}
+          >
+            <LinearIcon name="openExternal" />
+          </a>
+        )}
+        {compactProperties && onToggleTomatoAnalysis && (
+          <button
+            className={`tomato-analysis-toggle${task.tomatoAnalysisDisabled ? " is-paused" : ""}`}
+            type="button"
+            aria-label={task.tomatoAnalysisDisabled ? "恢复自动分析" : "设为人工判断"}
+            title={task.tomatoAnalysisDisabled ? "恢复自动分析" : "设为人工判断，不再自动分析"}
+            onClick={stopThen(() => onToggleTomatoAnalysis(task))}
+          >
+            <LinearIcon name="hand" />
+          </button>
+        )}
+        {!readOnly && <div className="card-actions" aria-label="移动议题">
           <button
             className="icon-button compact"
             type="button"
@@ -120,16 +184,56 @@ export function TaskCard({
           >
             <LinearIcon name="chevronRight" />
           </button>
-        </div>
+        </div>}
       </div>
 
-      <h3 id={`task-${task.id}-title`}>{task.title}</h3>
+      <h3 id={`task-${task.id}-title`}>{cardTitle}</h3>
 
       <div className="card-properties" aria-label="议题属性">
-        <span className={`priority-icon priority-icon-${task.priority}`} title={PRIORITY_LABELS[task.priority]}>
+        {compactProperties ? (
+          <>
+            <span className="label-chip">{compactProperties.itemType}</span>
+            <span className="label-chip creator-chip" title={`创建人：${compactProperties.creatorName}`}>
+              创建人：{compactProperties.creatorName}
+            </span>
+            {compactProperties.conversationActive && (
+              <span className="conversation-active-chip" role="status" title="Codex 正在处理这张卡片">
+                <span className="conversation-active-dot" aria-hidden="true" />
+                对话中
+              </span>
+            )}
+            {compactProperties.developmentBranches.map(({ repository, branch }) => (
+              <span
+                className="label-chip branch-chip"
+                key={`${repository}\0${branch}`}
+                title={`开发仓库：${repository}\n开发分支：${branch}`}
+              >
+                {repository} · {branch}
+              </span>
+            ))}
+            {compactProperties.hasConversation && (
+              compactProperties.threadId ? (
+                <button
+                  className="thread-link"
+                  type="button"
+                  aria-label={`查看历史对话 ${compactProperties.threadId}`}
+                  title="有历史对话"
+                  onClick={stopThen(() => onOpenThread(compactProperties.threadId!))}
+                >
+                  <LinearIcon name="conversation" />
+                </button>
+              ) : (
+                <span className="thread-link" aria-label="有历史对话" title="有历史对话">
+                  <LinearIcon name="conversation" />
+                </span>
+              )
+            )}
+          </>
+        ) : (<>
+          <span className={`priority-icon priority-icon-${task.priority}`} title={PRIORITY_LABELS[task.priority]}>
           <LinearPriorityIcon priority={task.priority} />
-        </span>
-        {activeBlockers > 0 && (
+          </span>
+          {activeBlockers > 0 && (
           <span className="blocked-by-count" title={`被 ${activeBlockers} 个未完成议题阻塞`}>
             <LinearIcon name="alert" />
             {activeBlockers}
@@ -139,6 +243,11 @@ export function TaskCard({
           <span className="sub-issue-progress-chip" title={`${completedSubIssues}/${subIssueTotal} 个子议题已完成`}>
             <span className="sub-issue-progress" aria-hidden="true" />
             {completedSubIssues}/{subIssueTotal}
+          </span>
+        )}
+        {relatedIssueCount > 0 && (
+          <span className="sub-issue-progress-chip" title={`关联 ${relatedIssueCount} 个事项`}>
+            <LinearIcon name="link" /> {relatedIssueCount}
           </span>
         )}
         {task.labels.slice(0, 2).map((label) => (
@@ -152,7 +261,7 @@ export function TaskCard({
             <LinearIcon name="calendar" /> {dueDate}
           </span>
         )}
-        {task.threadId && (
+          {task.threadId && (
           <button
             className="thread-link"
             type="button"
@@ -162,7 +271,8 @@ export function TaskCard({
           >
             <LinearIcon name="conversation" />
           </button>
-        )}
+          )}
+        </>)}
       </div>
     </article>
   );

@@ -3,9 +3,9 @@ import { execFile, spawn } from "node:child_process";
 import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isIP } from "node:net";
+import "./env.mjs";
 import os from "node:os";
 import path from "node:path";
-import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -17,13 +17,8 @@ import {
 } from "../shared/domain.mjs";
 import { normalizeWorkflowSnapshot } from "../shared/workflow-control-flow.mjs";
 import { AiChatService } from "./ai-chat.mjs";
-import { createCloudConfigStore } from "./cloud-config.mjs";
-import {
-  CloudProxyError,
-  createCloudProxy,
-  isLocalCompanionRoute,
-} from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
+import { TomatoSyncService } from "./tomato-sync.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -65,6 +60,23 @@ const CONTENT_TYPES = new Map([
   [".woff2", "font/woff2"],
 ]);
 
+async function openCodexThreadWithSystem(threadId) {
+  const query = new URLSearchParams({
+    source: "tomato-workboard",
+    request: randomUUID(),
+  });
+  const url = `codex://threads/${encodeURIComponent(threadId)}?${query}`;
+  if (process.platform === "darwin") {
+    await execFileAsync("/usr/bin/open", [url], { timeout: 5_000 });
+    return;
+  }
+  if (process.platform === "win32") {
+    await execFileAsync("cmd.exe", ["/d", "/s", "/c", "start", "", url], { timeout: 5_000 });
+    return;
+  }
+  await execFileAsync("xdg-open", [url], { timeout: 5_000 });
+}
+
 function sendJson(response, status, value, headers = {}) {
   const body = JSON.stringify(value);
   response.writeHead(status, {
@@ -79,52 +91,6 @@ function sendJson(response, status, value, headers = {}) {
 function sendEmpty(response, status, headers = {}) {
   response.writeHead(status, { "cache-control": "no-store", ...headers });
   response.end();
-}
-
-function toFetchRequest(request) {
-  const headers = new Headers();
-  for (const [name, value] of Object.entries(request.headers)) {
-    if (Array.isArray(value)) {
-      for (const entry of value) headers.append(name, entry);
-    } else if (value !== undefined) {
-      headers.set(name, value);
-    }
-  }
-  const init = { method: request.method, headers };
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    init.body = Readable.toWeb(request);
-    init.duplex = "half";
-  }
-  return new Request(`http://127.0.0.1${request.url}`, init);
-}
-
-async function sendFetchResponse(response, upstream) {
-  response.statusCode = upstream.status;
-  response.statusMessage = upstream.statusText;
-  for (const [name, value] of upstream.headers) {
-    if (
-      name === "connection"
-      || name === "content-encoding"
-      || name === "content-length"
-      || name === "set-cookie"
-      || name === "transfer-encoding"
-    ) {
-      continue;
-    }
-    response.setHeader(name, value);
-  }
-  const cookies = upstream.headers.getSetCookie?.() ?? [];
-  if (cookies.length > 0) response.setHeader("set-cookie", cookies);
-  if (!upstream.body) {
-    response.end();
-    return;
-  }
-  await new Promise((resolve, reject) => {
-    const body = Readable.fromWeb(upstream.body);
-    body.once("error", reject);
-    response.once("finish", resolve);
-    body.pipe(response);
-  });
 }
 
 function normalizeHostname(hostname) {
@@ -466,6 +432,18 @@ function validateProjectId(value, { required = true } = {}) {
   return id;
 }
 
+function parseTomatoLogin(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["token"]));
+  return { token: stringField(body.token, "token", { required: true, maxLength: 4096 }) };
+}
+
+function parseTomatoContextSwitch(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["contextId"]));
+  return { contextId: stringField(body.contextId, "contextId", { required: true, maxLength: 256 }) };
+}
+
 function parseProjectCreate(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["id", "name", "workspacePath"]));
@@ -495,10 +473,6 @@ function requestHeader(request, name) {
 }
 
 function actorFromRequest(request) {
-  if (request.headers["x-taskboard-client"] === "taskctl") {
-    return CODEX_AGENT_ACTOR;
-  }
-
   const rawId = requestHeader(request, "x-taskboard-user-id");
   const rawName = requestHeader(request, "x-taskboard-user-name");
   const rawAvatarUrl = requestHeader(request, "x-taskboard-user-avatar");
@@ -563,11 +537,30 @@ function parseWorkflowId(value) {
   return workflowId;
 }
 
+function parseTomatoRepositories(value) {
+  if (!Array.isArray(value) || value.length > 10) {
+    throw new ApiError(400, "INVALID_FIELD", "'tomatoRepositories' must be an array with at most 10 repositories");
+  }
+  const repositories = value.map((item, index) => {
+    assertPlainObject(item);
+    assertAllowedKeys(item, new Set(["projectId", "developmentBranch", "rebaseBranch"]));
+    return {
+      projectId: validateProjectId(item.projectId),
+      developmentBranch: stringField(item.developmentBranch ?? "", `tomatoRepositories[${index}].developmentBranch`, { maxLength: 512 }),
+      rebaseBranch: stringField(item.rebaseBranch ?? "", `tomatoRepositories[${index}].rebaseBranch`, { maxLength: 512 }),
+    };
+  });
+  if (new Set(repositories.map((item) => item.projectId)).size !== repositories.length) {
+    throw new ApiError(400, "INVALID_FIELD", "Each tomato repository may only be selected once");
+  }
+  return repositories;
+}
+
 function parseTaskCreate(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "projectId", "title", "description", "status", "priority", "labels", "sortOrder", "threadId",
-    "assigneeTarget", "workflowId", "developmentContext", "dueDate", "recurrence",
+    "assigneeTarget", "workflowId", "repositoryProjectId", "rebaseBranch", "tomatoRepositories", "tomatoAnalysisDisabled", "developmentContext", "dueDate", "recurrence",
   ]));
   const projectId = validateProjectId(body.projectId ?? DEFAULT_PROJECT_ID);
   const task = {
@@ -595,7 +588,7 @@ function parseTaskPatch(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "version", "title", "description", "status", "priority", "labels", "threadId",
-    "assigneeTarget", "workflowId", "developmentContext", "dueDate", "recurrence",
+    "assigneeTarget", "workflowId", "repositoryProjectId", "rebaseBranch", "tomatoRepositories", "tomatoAnalysisDisabled", "developmentContext", "dueDate", "recurrence",
   ]));
   const version = parseVersion(body.version);
   const threadId = parseThreadId(body.threadId);
@@ -607,6 +600,23 @@ function parseTaskPatch(body) {
   if (body.priority !== undefined) changes.priority = parsePriority(body.priority);
   if (body.labels !== undefined) changes.labels = parseLabels(body.labels);
   if (body.workflowId !== undefined) changes.workflowId = parseWorkflowId(body.workflowId);
+  if (body.repositoryProjectId !== undefined) {
+    changes.repositoryProjectId = body.repositoryProjectId === null
+      ? null
+      : validateProjectId(body.repositoryProjectId);
+  }
+  if (body.rebaseBranch !== undefined) {
+    changes.rebaseBranch = stringField(body.rebaseBranch, "rebaseBranch", { nullable: true, maxLength: 512 });
+  }
+  if (body.tomatoRepositories !== undefined) {
+    changes.tomatoRepositories = parseTomatoRepositories(body.tomatoRepositories);
+  }
+  if (body.tomatoAnalysisDisabled !== undefined) {
+    if (typeof body.tomatoAnalysisDisabled !== "boolean") {
+      throw new ApiError(400, "INVALID_FIELD", "'tomatoAnalysisDisabled' must be a boolean");
+    }
+    changes.tomatoAnalysisDisabled = body.tomatoAnalysisDisabled ? 1 : 0;
+  }
   if (body.developmentContext !== undefined) changes.developmentContext = parseDevelopmentContext(body.developmentContext);
   if (body.dueDate !== undefined) changes.dueDate = parseDueDate(body.dueDate);
   if (body.recurrence !== undefined) changes.recurrence = parseRecurrence(body.recurrence);
@@ -795,16 +805,18 @@ function parseAiThreadCreate(body) {
   assertAllowedKeys(body, new Set([
     "projectId",
     "issueId",
+    "issueProjectId",
     "title",
-    "model",
     "reasoningEffort",
     "sandbox",
   ]));
   return {
     projectId: validateProjectId(body.projectId),
     issueId: parseAiSetting(body.issueId, "issueId", 128),
+    issueProjectId: body.issueProjectId === undefined
+      ? undefined
+      : validateProjectId(body.issueProjectId),
     title: parseAiSetting(body.title, "title", 160),
-    model: parseAiSetting(body.model, "model", 128),
     reasoningEffort: parseAiSetting(body.reasoningEffort, "reasoningEffort", 64),
     sandbox: parseAiSandbox(body.sandbox),
   };
@@ -812,10 +824,9 @@ function parseAiThreadCreate(body) {
 
 function parseAiThreadPatch(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["title", "model", "reasoningEffort", "sandbox"]));
+  assertAllowedKeys(body, new Set(["title", "reasoningEffort", "sandbox"]));
   const input = {};
   if (body.title !== undefined) input.title = parseAiSetting(body.title, "title", 160);
-  if (body.model !== undefined) input.model = parseAiSetting(body.model, "model", 128);
   if (body.reasoningEffort !== undefined) {
     input.reasoningEffort = parseAiSetting(body.reasoningEffort, "reasoningEffort", 64);
   }
@@ -1026,12 +1037,24 @@ function codexProjectRoot(state, projectId) {
   return typeof root === "string" && root.trim() ? root : null;
 }
 
+function orderedCodexProjectIds(state, projects) {
+  const projectIds = Object.keys(projects);
+  const configuredOrder = Array.isArray(state?.["project-order"])
+    ? state["project-order"].filter((projectId) => typeof projectId === "string")
+    : [];
+  const seen = new Set();
+  return [
+    ...configuredOrder.filter((projectId) => projectIds.includes(projectId) && !seen.has(projectId) && seen.add(projectId)),
+    ...projectIds.filter((projectId) => !seen.has(projectId)),
+  ];
+}
+
 async function readCodexProjectWorkspaces(codexStatePath) {
   try {
     const state = JSON.parse(await readFile(codexStatePath, "utf8"));
     const projects = state["local-projects"];
     if (!projects || typeof projects !== "object" || Array.isArray(projects)) return {};
-    return Object.fromEntries(Object.keys(projects).flatMap((projectId) => {
+    return Object.fromEntries(orderedCodexProjectIds(state, projects).flatMap((projectId) => {
       const root = codexProjectRoot(state, projectId);
       return root ? [[projectId, root]] : [];
     }));
@@ -1268,20 +1291,128 @@ async function discoverWorkflowCapabilities(resolved, workspacePath) {
   return { skills, mcpServers };
 }
 
+function parseAnalysisRepositories(value, baseDirectory = PROJECT_ROOT) {
+  if (Array.isArray(value)) {
+    return value
+      .filter((entry) => typeof entry === "string")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => entry.startsWith("~/")
+        ? path.join(os.homedir(), entry.slice(2))
+        : path.resolve(baseDirectory, entry));
+  }
+
+  const raw = String(value ?? "").trim();
+  if (!raw) return [];
+  let entries;
+  try {
+    const parsed = JSON.parse(raw);
+    entries = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    entries = raw.split(/[,\n;]/u);
+  }
+  return parseAnalysisRepositories(entries, baseDirectory);
+}
+
+async function readCodexRepositories(codexStatePath) {
+  const workspaces = await readCodexProjectWorkspaces(codexStatePath);
+  const repositories = [];
+  for (const [projectId, workspacePath] of Object.entries(workspaces)) {
+    if (typeof workspacePath !== "string" || !path.isAbsolute(workspacePath)) continue;
+    let root = workspacePath;
+    try {
+      if (!(await stat(workspacePath)).isDirectory()) continue;
+      const rootResult = await execFileAsync("git", ["-C", workspacePath, "rev-parse", "--show-toplevel"], {
+        timeout: 4_000,
+        maxBuffer: 1024 * 1024,
+      });
+      root = rootResult.stdout.trim() || workspacePath;
+      const [currentResult, branchesResult] = await Promise.all([
+        execFileAsync("git", ["-C", root, "branch", "--show-current"], {
+          timeout: 4_000,
+          maxBuffer: 1024 * 1024,
+        }),
+        execFileAsync("git", ["-C", root, "for-each-ref", "--format=%(refname:short)", "refs/heads"], {
+          timeout: 4_000,
+          maxBuffer: 1024 * 1024,
+        }),
+      ]);
+      repositories.push({
+        projectId,
+        name: path.basename(root) || projectId,
+        workspacePath: root,
+        currentBranch: currentResult.stdout.trim() || null,
+        branches: branchesResult.stdout.split("\n").map((branch) => branch.trim()).filter(Boolean),
+      });
+      continue;
+    } catch {
+      // Keep a configured Codex project visible even when its directory is not a Git worktree.
+    }
+    repositories.push({
+      projectId,
+      name: path.basename(root) || projectId,
+      workspacePath: root,
+      currentBranch: null,
+      branches: [],
+    });
+  }
+  return repositories;
+}
+
+async function resolveAnalysisRepositories(resolved) {
+  if (resolved.analysisRepositories.length > 0) return resolved.analysisRepositories;
+
+  const workspaces = await readCodexProjectWorkspaces(resolved.codexStatePath);
+  const repositories = [];
+  for (const workspacePath of Object.values(workspaces)) {
+    if (typeof workspacePath !== "string" || !path.isAbsolute(workspacePath)) continue;
+    try {
+      if (!(await stat(workspacePath)).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    if (!repositories.includes(workspacePath)) repositories.push(workspacePath);
+  }
+  return repositories;
+}
+
 export function resolveServerOptions(options = {}) {
   const configuredDataDirectory = options.dataDirectory ?? process.env.CODEX_TASKBOARD_DATA_DIR;
   const dataDirectory = configuredDataDirectory
     ? path.resolve(configuredDataDirectory)
     : path.join(PROJECT_ROOT, ".data");
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  const codexExecutable = options.codexExecutable ?? process.env.CODEX_EXECUTABLE ?? "codex";
+  const analysisRepositories = parseAnalysisRepositories(
+    options.analysisRepositories ?? process.env.TOMATO_ANALYSIS_REPOSITORIES,
+  );
+  const tomatoOrigin = options.tomatoOrigin
+    ?? process.env.TOMATO_HOST
+    ?? "https://osc.gitee.work";
+  const tomatoTenant = options.tomatoTenant
+    ?? process.env.TOMATO_TENANT
+    ?? "";
+  const tomatoProfile = options.tomatoProfile
+    ?? process.env.TOMATO_PROFILE
+    ?? "osc";
+  const tomatoContext = options.tomatoContext
+    ?? process.env.TOMATO_CONTEXT
+    ?? "";
   return {
     dataDirectory,
     databasePath: options.databasePath ?? path.join(dataDirectory, "taskboard.sqlite"),
     attachmentsDirectory: options.attachmentsDirectory ?? path.join(dataDirectory, "attachments"),
-    cloudConfigPath: options.cloudConfigPath ?? path.join(dataDirectory, "cloud-companion.json"),
     staticDirectory: options.staticDirectory ?? path.join(PROJECT_ROOT, "dist", "web"),
-    skillPath: options.skillPath ?? path.join(PROJECT_ROOT, "skills", "manage-taskboard", "SKILL.md"),
-    codexExecutable: options.codexExecutable ?? process.env.CODEX_EXECUTABLE ?? "codex",
+    skillPath: options.skillPath ?? path.join(PROJECT_ROOT, "skills", "tomato-workboard", "SKILL.md"),
+    codexExecutable,
+    tomatoCliExecutable: options.tomatoCliExecutable
+      ?? process.env.TOMATO_CLI_EXECUTABLE
+      ?? "gitee",
+    analysisRepositories,
+    tomatoOrigin,
+    tomatoTenant,
+    tomatoProfile,
+    tomatoContext,
     codexStatePath: options.codexStatePath
       ?? path.join(codexHome, ".codex-global-state.json"),
     codexProcessesPath: options.codexProcessesPath
@@ -1309,30 +1440,24 @@ export function createTaskboardServer(options = {}) {
   const resolved = resolveServerOptions(options);
   const database = new TaskboardDatabase(resolved.databasePath);
   const events = new EventHub();
-  const cloudConfig = options.cloudConfigStore ?? createCloudConfigStore({
-    configPath: resolved.cloudConfigPath,
-  });
-  const cloudProxy = createCloudProxy({
-    configStore: cloudConfig,
-    fetch: options.remoteFetch ?? globalThis.fetch,
-    resolveDevelopmentContext: async (projectId, context) => {
-      if (!context.branch) return null;
-      const config = await cloudConfig.read();
-      const workspacePath = config.projectMappings[projectId];
-      if (!workspacePath) return null;
-      const result = await scanDevelopmentContexts(workspacePath);
-      return result.contexts.find((candidate) => (
-        candidate.type === "worktree" && candidate.branch === context.branch
-      )) ?? null;
-    },
-  });
   const aiChat = new AiChatService({
     database,
     codexExecutable: resolved.codexExecutable,
     codexStatePath: resolved.codexStatePath,
-    manageTaskboardSkillPath: resolved.skillPath,
+    fallbackWorkspacePath: PROJECT_ROOT,
+    tomatoWorkboardSkillPath: resolved.skillPath,
   });
+  const tomatoSync = new TomatoSyncService({
+    database,
+    cliExecutable: resolved.tomatoCliExecutable,
+    workspacePath: PROJECT_ROOT,
+    host: resolved.tomatoOrigin,
+    profile: resolved.tomatoProfile,
+    defaultContext: resolved.tomatoContext,
+  });
+  const openCodexThread = options.openCodexThread ?? openCodexThreadWithSystem;
   const aiEventResponses = new Set();
+  let tomatoAnalysisProgress = { running: false, itemKey: null, threadId: null, cancelRequested: false, messages: [], updatedAt: null };
 
   const server = createServer(async (request, response) => {
     response.setHeader("x-content-type-options", "nosniff");
@@ -1347,84 +1472,9 @@ export function createTaskboardServer(options = {}) {
       } else if (pathname.startsWith("/api/local/")) {
         assertLoopbackRequest(request);
       }
-      const isMachineCapabilityRoute = pathname === "/api/meta"
-        || pathname === "/api/device-workspaces"
-        || pathname === "/api/workflow-capabilities"
-        || /^\/api\/projects\/[^/]+\/development-contexts$/.test(pathname);
-      const capabilityCloudConfig = isMachineCapabilityRoute
-        ? await cloudConfig.read()
-        : null;
-      if (capabilityCloudConfig?.remoteUrl) assertLoopbackRequest(request);
-
       if (pathname === "/health") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         return sendJson(response, 200, { status: "ok" });
-      }
-
-      if (pathname === "/api/local/cloud-session") {
-        if ([...url.searchParams.keys()].length > 0) {
-          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Cloud session routes do not accept query parameters");
-        }
-        if (request.method === "GET") {
-          const config = await cloudConfig.read();
-          return sendJson(response, 200, config.remoteUrl
-            ? {
-              mode: "cloud",
-              remoteUrl: config.remoteUrl,
-              actorName: config.actorName,
-              authenticated: true,
-            }
-            : { mode: "local", authenticated: false });
-        }
-        if (request.method === "PUT") {
-          const body = await readJson(request);
-          assertPlainObject(body);
-          assertAllowedKeys(body, new Set(["remoteUrl", "actorName", "sharedKey"]));
-          try {
-            const config = await cloudConfig.configure({
-              remoteUrl: body.remoteUrl,
-              actorName: body.actorName,
-              sharedKey: body.sharedKey,
-            });
-            return sendJson(response, 200, {
-              mode: "cloud",
-              remoteUrl: config.remoteUrl,
-              actorName: config.actorName,
-              authenticated: true,
-            });
-          } catch (error) {
-            throw new ApiError(400, error.code ?? "INVALID_CLOUD_CONFIG", error.message);
-          }
-        }
-        if (request.method === "DELETE") {
-          await cloudConfig.clearCloud();
-          return sendJson(response, 200, { mode: "local", authenticated: false });
-        }
-        return methodNotAllowed(response, ["GET", "PUT", "DELETE"]);
-      }
-
-      const projectMappingRoute = pathname.match(/^\/api\/local\/project-mappings\/([^/]+)$/);
-      if (projectMappingRoute) {
-        if (request.method !== "PUT") return methodNotAllowed(response, ["PUT"]);
-        if ([...url.searchParams.keys()].length > 0) {
-          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Project mapping routes do not accept query parameters");
-        }
-        let projectId;
-        try {
-          projectId = decodeURIComponent(projectMappingRoute[1]);
-        } catch {
-          throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
-        }
-        validateProjectId(projectId);
-        const body = await readJson(request);
-        assertPlainObject(body);
-        assertAllowedKeys(body, new Set(["workspacePath"]));
-        const workspacePath = pathField(body.workspacePath, "workspacePath");
-        if (!workspacePath || !path.isAbsolute(workspacePath)) {
-          throw new ApiError(400, "INVALID_FIELD", "'workspacePath' must be absolute");
-        }
-        await cloudConfig.setProjectWorkspace(projectId, workspacePath);
-        return sendJson(response, 200, { projectId, workspacePath });
       }
 
       if (pathname === "/api/meta") {
@@ -1433,15 +1483,12 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/meta does not accept query parameters");
         }
         return sendJson(response, 200, {
-          manageTaskboardSkillPath: resolved.skillPath,
+          tomatoWorkboardSkillPath: resolved.skillPath,
+          analysisRepositories: await resolveAnalysisRepositories(resolved),
+          tomato: { origin: resolved.tomatoOrigin, tenant: resolved.tomatoTenant },
           capabilities: { localAiChat: isLoopbackAddress(request.socket.remoteAddress) },
-          ...(capabilityCloudConfig?.remoteUrl
-            ? {
-              mode: "cloud",
-              realtime: { transport: "poll", intervalMs: 2000 },
-              localCapabilities: { available: true },
-            }
-            : {}),
+          mode: "local",
+          realtime: { transport: "poll", intervalMs: 2000 },
         });
       }
 
@@ -1452,12 +1499,235 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, await aiChat.getCatalog(projectId));
       }
 
+      if (pathname === "/api/local/tomato/session") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/tomato/session");
+        try {
+          return sendJson(response, 200, await tomatoSync.getSession());
+        } catch (error) {
+          if (error?.code === "TOMATO_CLI_ERROR") {
+            const output = [error.details?.stderr, error.details?.stdout, error.details?.output, error.message].filter(Boolean).join(" ").toLowerCase();
+            const requiresAuth = /未登录|not logged|no profiles configured|authentication required|unauthenticated|未配置企业 context|context required|no context/.test(output);
+            throw new ApiError(requiresAuth ? 401 : 502, requiresAuth ? "TOMATO_AUTH_REQUIRED" : error.code, error.message, error.details);
+          }
+          throw error;
+        }
+      }
+
+      if (pathname === "/api/local/tomato/login") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/tomato/login");
+        const { token } = parseTomatoLogin(await readJson(request));
+        try {
+          return sendJson(response, 200, await tomatoSync.login(token));
+        } catch (error) {
+          if (error?.code === "TOMATO_CLI_ERROR") {
+            const status = error.details?.reason === "LOGIN_FAILED" ? 400 : 502;
+            throw new ApiError(status, error.code, error.message, error.details);
+          }
+          throw error;
+        }
+      }
+
+      if (pathname === "/api/local/tomato/context") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/tomato/context");
+        const { contextId } = parseTomatoContextSwitch(await readJson(request));
+        try {
+          return sendJson(response, 200, await tomatoSync.switchContext(contextId));
+        } catch (error) {
+          if (error?.code === "TOMATO_CLI_ERROR") {
+            const output = [error.details?.stderr, error.details?.stdout, error.details?.output, error.message].filter(Boolean).join(" ").toLowerCase();
+            const requiresAuth = /未登录|not logged|no profiles configured|authentication required|unauthenticated|未配置企业 context|context required|no context/.test(output);
+            throw new ApiError(requiresAuth ? 401 : 502, requiresAuth ? "TOMATO_AUTH_REQUIRED" : error.code, error.message, error.details);
+          }
+          throw error;
+        }
+      }
+
+      if (pathname === "/api/local/tomato/sync") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/tomato/sync");
+        await assertEmptyRequestBody(request, "POST /api/local/tomato/sync");
+        let result;
+        try {
+          result = await tomatoSync.sync();
+        } catch (error) {
+          if (error?.code === "TOMATO_CLI_ERROR") {
+            const output = [error.details?.stderr, error.details?.stdout, error.details?.output, error.message].filter(Boolean).join(" ").toLowerCase();
+            const requiresAuth = /未登录|not logged|no profiles configured|authentication required|unauthenticated|未配置企业 context|context required|no context/.test(output);
+            throw new ApiError(requiresAuth ? 401 : 502, requiresAuth ? "TOMATO_AUTH_REQUIRED" : error.code, error.message, error.details);
+          }
+          throw error;
+        }
+        events.emit("task.updated", { projectId: "tomato" });
+        return sendJson(response, 200, result);
+      }
+
+      if (pathname === "/api/local/tomato/analysis-candidates") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/tomato/analysis-candidates");
+        return sendJson(response, 200, { tasks: database.listTomatoAnalysisCandidates() });
+      }
+
+      if (pathname === "/api/local/tomato/analysis-progress") {
+        assertNoQuery(url.searchParams, `${request.method} /api/local/tomato/analysis-progress`);
+        if (request.method === "GET") return sendJson(response, 200, tomatoAnalysisProgress);
+        if (request.method !== "POST") return methodNotAllowed(response, ["GET", "POST"]);
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["running", "itemKey", "threadId", "message", "cancelRequested"]));
+        if (typeof body.running !== "boolean") {
+          throw new ApiError(400, "INVALID_FIELD", "running must be a boolean");
+        }
+        const itemKey = body.itemKey == null
+          ? null
+          : stringField(body.itemKey, "itemKey", { required: true, maxLength: 256 });
+        const threadId = body.threadId === undefined
+          ? tomatoAnalysisProgress.threadId
+          : body.threadId == null
+            ? null
+            : stringField(body.threadId, "threadId", { required: true, maxLength: 256 });
+        const message = body.message == null
+          ? null
+          : stringField(body.message, "message", { required: true, maxLength: 8000 });
+        const messages = body.running && itemKey === null && !tomatoAnalysisProgress.running
+          ? []
+          : [...tomatoAnalysisProgress.messages];
+        if (message) messages.push({ content: message, at: Date.now() });
+        const cancelRequested = body.cancelRequested === undefined
+          ? (body.running && itemKey === null && !tomatoAnalysisProgress.running ? false : tomatoAnalysisProgress.cancelRequested)
+          : body.cancelRequested === true;
+        tomatoAnalysisProgress = { running: body.running, itemKey, threadId, cancelRequested, messages: messages.slice(-100), updatedAt: Date.now() };
+        return sendJson(response, 200, tomatoAnalysisProgress);
+      }
+
+      const tomatoAnalysisRoute = pathname.match(/^\/api\/local\/tomato\/items\/([^/]+)\/analysis$/);
+      if (tomatoAnalysisRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/tomato/items/:id/analysis");
+        const itemKey = decodeRouteSegment(tomatoAnalysisRoute[1], "Tomato item key");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set([
+          "status", "summary", "repairPlan", "decision", "missingInformation", "evidenceKey",
+        ]));
+        const status = stringField(body.status, "status", { required: true, maxLength: 32 });
+        if (!["fixable", "needs_human", "insufficient"].includes(status)) {
+          throw new ApiError(400, "INVALID_FIELD", "status must be fixable, needs_human, or insufficient");
+        }
+        const task = database.saveTomatoAnalysis(itemKey, {
+          status,
+          summary: stringField(body.summary, "summary", { required: true, maxLength: 4000 }),
+          repairPlan: stringField(body.repairPlan, "repairPlan", { required: true, maxLength: 8000 }),
+          decision: stringField(body.decision, "decision", { nullable: true, maxLength: 2000 }) ?? null,
+          missingInformation: stringField(body.missingInformation, "missingInformation", { nullable: true, maxLength: 2000 }) ?? null,
+          evidenceKey: stringField(body.evidenceKey, "evidenceKey", { required: true, maxLength: 4000 }),
+        });
+        events.emit("task.updated", { projectId: "tomato", taskId: task.id });
+        return sendJson(response, 200, { task });
+      }
+
+      const tomatoAnalysisToggleRoute = pathname.match(/^\/api\/local\/tomato\/items\/([^/]+)\/analysis-toggle$/);
+      if (tomatoAnalysisToggleRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/tomato/items/:id/analysis-toggle");
+        const itemKey = decodeRouteSegment(tomatoAnalysisToggleRoute[1], "Tomato item key");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["disabled"]));
+        if (typeof body.disabled !== "boolean") {
+          throw new ApiError(400, "INVALID_FIELD", "disabled must be a boolean");
+        }
+        const task = database.setTomatoAnalysisDisabled(itemKey, body.disabled);
+        events.emit("task.updated", { projectId: "tomato", taskId: task.id });
+        return sendJson(response, 200, { task });
+      }
+
+      const openCodexThreadRoute = pathname.match(/^\/api\/local\/codex\/threads\/([^/]+)\/open$/);
+      if (openCodexThreadRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/codex/threads/:id/open");
+        await assertEmptyRequestBody(request, "POST /api/local/codex/threads/:id/open");
+        const threadId = decodeRouteSegment(openCodexThreadRoute[1], "Codex thread id");
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(threadId)) {
+          throw new ApiError(400, "INVALID_FIELD", "Codex thread id contains unsupported characters");
+        }
+        await aiChat.syncNativeThreadName(threadId).catch(() => null);
+        await openCodexThread(threadId);
+        return sendJson(response, 200, { threadId });
+      }
+
+      const tomatoItemRoute = pathname.match(
+        /^\/api\/local\/tomato\/items\/([^/]+)\/(transitions|transition)$/,
+      );
+      if (tomatoItemRoute) {
+        assertNoQuery(url.searchParams, `${request.method} ${pathname}`);
+        const itemKey = decodeRouteSegment(tomatoItemRoute[1], "Tomato item key");
+        const action = tomatoItemRoute[2];
+        try {
+          if (action === "transitions") {
+            if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+            return sendJson(response, 200, {
+              itemKey,
+              transitions: await tomatoSync.getAvailableTransitions(itemKey),
+            });
+          }
+
+          if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+          const body = await readJson(request);
+          assertPlainObject(body);
+          assertAllowedKeys(body, new Set(["targetStatus", "noFixReason"]));
+          const targetStatus = stringField(body.targetStatus, "targetStatus", {
+            required: true,
+            maxLength: 64,
+          });
+          const noFixReason = stringField(body.noFixReason, "noFixReason", {
+            required: false,
+            maxLength: 64,
+          });
+          const result = await tomatoSync.transition(itemKey, targetStatus, { noFixReason });
+          events.emit("task.updated", { projectId: "tomato" });
+          return sendJson(response, 200, result);
+        } catch (error) {
+          if (error?.code === "TOMATO_CLI_ERROR") {
+            const status = error.details?.reason === "TRANSITION_UNAVAILABLE"
+              ? 409
+              : error.details?.reason === "INVALID_NO_FIX_REASON"
+                ? 400
+                : 502;
+            throw new ApiError(status, error.code, error.message, error.details);
+          }
+          throw error;
+        }
+      }
+
       if (pathname === "/api/local/ai/threads") {
-        assertNoQuery(url.searchParams, "/api/local/ai/threads");
         if (request.method === "GET") {
-          return sendJson(response, 200, { threads: await aiChat.listThreads() });
+          assertAllowedQuery(
+            url.searchParams,
+            new Set(["issueId", "issueIdentifier", "projectId"]),
+            "GET /api/local/ai/threads",
+          );
+          const issueId = stringField(url.searchParams.get("issueId") ?? null, "issueId", {
+            nullable: true,
+            maxLength: 128,
+          });
+          const issueIdentifier = stringField(
+            url.searchParams.get("issueIdentifier") ?? null,
+            "issueIdentifier",
+            { nullable: true, maxLength: 128 },
+          );
+          const projectId = stringField(url.searchParams.get("projectId") ?? null, "projectId", {
+            nullable: true,
+            maxLength: 128,
+          });
+          return sendJson(response, 200, {
+            threads: await aiChat.listThreads({ issueId, issueIdentifier, projectId }),
+          });
         }
         if (request.method === "POST") {
+          assertNoQuery(url.searchParams, "POST /api/local/ai/threads");
           const thread = await aiChat.createThread(parseAiThreadCreate(await readJson(request)));
           return sendJson(response, 201, { thread });
         }
@@ -1469,7 +1739,8 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         assertNoQuery(url.searchParams, "GET /api/local/ai/threads/:id/events");
         const threadId = decodeRouteSegment(aiThreadEventsRoute[1], "Thread id");
-        await aiChat.getThreadSnapshot(threadId);
+        await aiChat.syncNativeThread(threadId);
+        aiChat.getThreadSnapshot(threadId);
         response.writeHead(200, {
           connection: "keep-alive",
           "cache-control": "no-cache, no-transform",
@@ -1514,6 +1785,7 @@ export function createTaskboardServer(options = {}) {
         assertNoQuery(url.searchParams, "/api/local/ai/threads/:id");
         const threadId = decodeRouteSegment(aiThreadRoute[1], "Thread id");
         if (request.method === "GET") {
+          await aiChat.syncNativeThread(threadId);
           return sendJson(response, 200, await aiChat.getThreadSnapshot(threadId));
         }
         if (request.method === "PATCH") {
@@ -1548,6 +1820,14 @@ export function createTaskboardServer(options = {}) {
         });
       }
 
+      if (pathname === "/api/codex-repositories") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/codex-repositories does not accept query parameters");
+        }
+        return sendJson(response, 200, { repositories: await readCodexRepositories(resolved.codexStatePath) });
+      }
+
       if (pathname === "/api/workflow-capabilities") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         const unknownQuery = [...url.searchParams.keys()].filter((key) => key !== "workspacePath");
@@ -1570,20 +1850,6 @@ export function createTaskboardServer(options = {}) {
           200,
           await discoverWorkflowCapabilities(resolved, workspacePath ?? PROJECT_ROOT),
         );
-      }
-
-      let currentCloudConfig = null;
-      if (pathname.startsWith("/api/")) {
-        currentCloudConfig = await cloudConfig.read();
-        if (currentCloudConfig.remoteUrl) {
-          assertLoopbackRequest(request);
-          if (!isLocalCompanionRoute(pathname)) {
-            return sendFetchResponse(
-              response,
-              await cloudProxy.forward(toFetchRequest(request)),
-            );
-          }
-        }
       }
 
       if (pathname === "/api/projects") {
@@ -1644,12 +1910,7 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
         }
         validateProjectId(projectId);
-        const project = currentCloudConfig.remoteUrl
-          ? {
-            id: projectId,
-            workspacePath: currentCloudConfig.projectMappings[projectId] ?? null,
-          }
-          : database.getProject(projectId);
+        const project = database.getProject(projectId);
         if (!project) throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
         const codexProjectId = stringField(url.searchParams.get("codexProjectId") ?? null, "codexProjectId", {
           nullable: true,
@@ -2032,12 +2293,6 @@ export function createTaskboardServer(options = {}) {
         sendJson(response, error.status, payload);
         return;
       }
-      if (error instanceof CloudProxyError) {
-        const payload = { error: { code: error.code, message: error.message } };
-        if (error.details !== undefined) payload.error.details = error.details;
-        sendJson(response, error.status, payload);
-        return;
-      }
       console.error(error);
       sendJson(response, 500, { error: { code: "INTERNAL_ERROR", message: "Internal server error" } });
     }
@@ -2067,6 +2322,9 @@ export function createTaskboardServer(options = {}) {
         server.listen(port, host);
       });
       listening = true;
+      void aiChat.repairTomatoThreadNames().catch((error) => {
+        console.warn("Could not repair Tomato AI chat names", error);
+      });
       return server.address();
     },
     async close() {
@@ -2079,6 +2337,7 @@ export function createTaskboardServer(options = {}) {
       for (const response of aiEventResponses) response.end();
       aiEventResponses.clear();
       await aiChat.close();
+      tomatoSync.close();
       await serverClosed;
       listening = false;
       database.close();

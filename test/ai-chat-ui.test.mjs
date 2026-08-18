@@ -109,7 +109,7 @@ test("turn input contains only visible user content, real skill ids and one-time
     dangerFullAccessConfirmed: true,
   });
   assert.equal(JSON.stringify(buildTurnInput("hello", [], false)).includes("workspacePath"), false);
-  assert.equal(JSON.stringify(buildTurnInput("hello", [], false)).includes("manage-taskboard"), false);
+  assert.equal(JSON.stringify(buildTurnInput("hello", [], false)).includes("tomato-workboard"), false);
 });
 
 test("running threads expose stop, danger-full-access requires confirmation, and SSE is a refresh hint", () => {

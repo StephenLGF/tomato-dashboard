@@ -8,6 +8,7 @@ import type {
   AiChatThreadSnapshot,
   Attachment,
   Comment,
+  CodexRepository,
   DevelopmentScan,
   IssueRelationType,
   Project,
@@ -74,13 +75,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(0, {
       error: {
         code: "SERVICE_UNAVAILABLE",
-        message: "无法连接本地 Taskboard 服务，请重新通过 Taskboard 启动 Codex。",
+        message: "无法连接本地工作台服务，请确认工作台已启动后重试。",
       },
     });
   }
   const body = (await response.json().catch(() => ({}))) as T & ApiErrorBody;
 
-  if (!response.ok) throw new ApiError(response.status, body);
+  if (!response.ok) {
+    const error = new ApiError(response.status, body);
+    if (isTomatoAuthError(error) && typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("tomato-auth-required"));
+    }
+    throw error;
+  }
   return body;
 }
 
@@ -116,11 +123,35 @@ export async function listAiChatThreads(signal?: AbortSignal): Promise<AiChatThr
   return data.threads;
 }
 
+export async function listAiChatThreadsForIssueIdentifier(
+  issueIdentifier: string,
+  signal?: AbortSignal,
+): Promise<AiChatThread[]> {
+  const query = new URLSearchParams({ issueIdentifier });
+  const data = await request<{ threads: AiChatThread[] }>(
+    `/api/local/ai/threads?${query}`,
+    { signal },
+  );
+  return data.threads;
+}
+
+export async function listAiChatThreadsForProject(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<AiChatThread[]> {
+  const query = new URLSearchParams({ projectId });
+  const data = await request<{ threads: AiChatThread[] }>(
+    `/api/local/ai/threads?${query}`,
+    { signal },
+  );
+  return data.threads;
+}
+
 export async function createAiChatThread(input: {
   projectId: string;
   issueId?: string;
+  issueProjectId?: string;
   title?: string;
-  model?: string;
   reasoningEffort?: string;
   sandbox?: AiChatSandbox;
 }): Promise<AiChatThread> {
@@ -145,7 +176,6 @@ export async function updateAiChatThread(
   threadId: string,
   input: {
     title?: string;
-    model?: string;
     reasoningEffort?: string;
     sandbox?: AiChatSandbox;
   },
@@ -204,6 +234,11 @@ export function subscribeAiChatThread(
   source.addEventListener("ai.run", () => onHint("ai.run"));
   if (onError) source.addEventListener("error", onError);
   return () => source.close();
+}
+
+export async function listCodexRepositories(signal?: AbortSignal): Promise<CodexRepository[]> {
+  const data = await request<{ repositories: CodexRepository[] }>("/api/codex-repositories", { signal });
+  return data.repositories;
 }
 
 export async function listDeviceWorkspaces(signal?: AbortSignal): Promise<Record<string, string>> {
@@ -288,6 +323,139 @@ export async function listTasks(projectId: string, signal?: AbortSignal): Promis
   return data.tasks;
 }
 
+export interface TomatoContext {
+  id: string;
+  name: string;
+  description?: string | null;
+}
+
+export interface TomatoSession {
+  authenticated: boolean;
+  profile: string;
+  host: string;
+  contexts: TomatoContext[];
+  context: TomatoContext | null;
+  user: unknown;
+}
+
+export function isTomatoAuthError(error: unknown): error is ApiError {
+  return error instanceof ApiError && (error.code === "TOMATO_AUTH_REQUIRED" || error.status === 401);
+}
+
+export interface TomatoSyncResult {
+  total: number;
+  created: number;
+  updated: number;
+  archived: number;
+  sourceCount: number;
+  fetchedCount: number;
+  excludedCount: number;
+  nextPageIndex: number;
+  truncated: boolean;
+}
+
+export async function getTomatoSession(signal?: AbortSignal): Promise<TomatoSession> {
+  return request<TomatoSession>("/api/local/tomato/session", { signal });
+}
+
+export async function loginTomato(token: string): Promise<TomatoSession> {
+  return request<TomatoSession>("/api/local/tomato/login", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
+}
+
+export async function switchTomatoContext(contextId: string): Promise<TomatoSession> {
+  return request<TomatoSession>("/api/local/tomato/context", {
+    method: "POST",
+    body: JSON.stringify({ contextId }),
+  });
+}
+
+export async function syncTomatoItems(): Promise<TomatoSyncResult> {
+  return request<TomatoSyncResult>("/api/local/tomato/sync", { method: "POST" });
+}
+
+export async function setTomatoAnalysisDisabled(itemKey: string, disabled: boolean): Promise<Task> {
+  const data = await request<{ task: Task }>(
+    `/api/local/tomato/items/${encodeURIComponent(itemKey)}/analysis-toggle`,
+    { method: "POST", body: JSON.stringify({ disabled }) },
+  );
+  return data.task;
+}
+
+export interface TomatoAnalysisProgress {
+  running: boolean;
+  itemKey: string | null;
+  threadId: string | null;
+  cancelRequested: boolean;
+  messages: Array<{ content: string; at: number }>;
+  updatedAt: number | null;
+}
+
+export async function getTomatoAnalysisProgress(signal?: AbortSignal): Promise<TomatoAnalysisProgress> {
+  return request<TomatoAnalysisProgress>("/api/local/tomato/analysis-progress", { signal });
+}
+
+export async function setTomatoAnalysisProgress(running: boolean, itemKey: string | null, threadId?: string | null, message?: string, cancelRequested?: boolean): Promise<TomatoAnalysisProgress> {
+  return request<TomatoAnalysisProgress>("/api/local/tomato/analysis-progress", {
+    method: "POST",
+    body: JSON.stringify({ running, itemKey, ...(threadId === undefined ? {} : { threadId }), ...(message ? { message } : {}), ...(cancelRequested === undefined ? {} : { cancelRequested }) }),
+  });
+}
+
+export async function openCodexThread(threadId: string): Promise<void> {
+  await request<{ threadId: string }>(
+    `/api/local/codex/threads/${encodeURIComponent(threadId)}/open`,
+    { method: "POST" },
+  );
+}
+
+export interface TomatoTransition {
+  transition: string;
+  targetStatus: string;
+  disabled: boolean;
+  disabledReason?: string;
+  missingRequiredFields: Array<{ fieldKey?: string; fieldName: string; message?: string }>;
+  requirementsKnown: boolean;
+  requiresAgentPreflight?: boolean;
+}
+
+export interface TomatoTransitionResult {
+  itemKey: string;
+  previousStatus: string;
+  currentStatus: string;
+  targetStatus: string;
+  transition: string | null;
+  alreadyInTarget: boolean;
+  noFixReason?: string;
+}
+
+export async function listTomatoTransitions(
+  itemKey: string,
+  signal?: AbortSignal,
+): Promise<TomatoTransition[]> {
+  const data = await request<{ itemKey: string; transitions: TomatoTransition[] }>(
+    `/api/local/tomato/items/${encodeURIComponent(itemKey)}/transitions`,
+    { signal },
+  );
+  return data.transitions;
+}
+
+export async function transitionTomatoItem(
+  itemKey: string,
+  targetStatus: string,
+  options: { noFixReason?: string } = {},
+): Promise<TomatoTransitionResult> {
+  return request<TomatoTransitionResult>(
+    `/api/local/tomato/items/${encodeURIComponent(itemKey)}/transition`,
+    {
+      method: "POST",
+      body: JSON.stringify({ targetStatus, ...options }),
+    },
+  );
+}
+
 export async function createTask(projectId: string, draft: TaskDraft, threadId?: string): Promise<Task> {
   const data = await request<{ task: Task }>("/api/tasks", {
     method: "POST",
@@ -296,7 +464,7 @@ export async function createTask(projectId: string, draft: TaskDraft, threadId?:
   return data.task;
 }
 
-export async function updateTask(task: Task, draft: TaskDraft, threadId?: string): Promise<Task> {
+export async function updateTask(task: Task, draft: Partial<TaskDraft>, threadId?: string): Promise<Task> {
   const data = await request<{ task: Task }>(`/api/tasks/${encodeURIComponent(task.id)}`, {
     method: "PATCH",
     body: JSON.stringify({ version: task.version, ...draft, ...(threadId ? { threadId } : {}) }),

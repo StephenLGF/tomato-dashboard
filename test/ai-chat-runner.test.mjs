@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import { TaskboardDatabase } from "../server/database.mjs";
 import { AiChatService } from "../server/ai-chat.mjs";
+import { readCodexThreadModel } from "../server/ai-chat-catalog.mjs";
 import { normalizeCodexEvent } from "../server/ai-chat-process.mjs";
 
 async function waitFor(predicate, timeout = 4_000) {
@@ -31,6 +32,61 @@ test("normalized item events retain a bounded public item id", () => {
   });
 
   assert.equal(normalized.data.itemId, itemId.slice(0, 65_536));
+});
+
+test("resumed conversations use the model recorded by the native Codex session", async () => {
+  const fixture = await createFixture();
+  try {
+    const thread = await fixture.service.createThread({ projectId: "project" });
+    fixture.database.updateAiChatThread(thread.id, {
+      reasoningEffort: "ultra",
+      codexThreadId: "legacy-codex-thread",
+    });
+    fixture.setCodexThreadModel("legacy-codex-thread", "gpt-real");
+
+    const run = await fixture.service.startTurn(thread.id, {
+      message: "migrate legacy model",
+      dangerFullAccessConfirmed: true,
+    });
+    await waitFor(() => fixture.service.getRun(run.id)?.status !== "running");
+
+    const capture = JSON.parse((await readFile(fixture.capturePath, "utf8")).trim());
+    assert.equal(capture.args.includes("resume"), true);
+    assert.deepEqual(capture.args.slice(capture.args.indexOf("-m"), capture.args.indexOf("-m") + 2), [
+      "-m",
+      "gpt-real",
+    ]);
+    assert.equal(fixture.service.getThread(thread.id).codexThreadId, "legacy-codex-thread");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("native Codex session model is read from the latest recorded turn without local persistence", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-codex-session-"));
+  try {
+    const sessionsPath = path.join(directory, "sessions", "2026", "08", "11");
+    await mkdir(sessionsPath, { recursive: true });
+    await writeFile(path.join(directory, "codex-state.json"), "{}");
+    await writeFile(
+      path.join(sessionsPath, "rollout-2026-08-11T00-00-00-native-thread.jsonl"),
+      [
+        JSON.stringify({ type: "turn_context", payload: { model: "gpt-5.6-luna" } }),
+        "{malformed",
+        JSON.stringify({ type: "event_msg", payload: { thread_settings: { model: "gpt-5.6-sol" } } }),
+      ].join("\n"),
+    );
+    assert.equal(
+      await readCodexThreadModel(path.join(directory, "codex-state.json"), "native-thread"),
+      "gpt-5.6-sol",
+    );
+    assert.equal(
+      await readCodexThreadModel(path.join(directory, "codex-state.json"), "../unsafe"),
+      null,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 async function createFixture() {
@@ -138,17 +194,27 @@ if (args[0] === "app-server") {
   const database = new TaskboardDatabase(databasePath);
   database.createProject({ id: "project", name: "Project", workspacePath: null });
   database.createProject({ id: "other", name: "Other", workspacePath: null });
+  let gitBranch = "main";
+  const nativeThreadNames = [];
+  const codexThreadModels = new Map();
   const service = new AiChatService({
     database,
     codexExecutable: executable,
     codexStatePath,
-    manageTaskboardSkillPath: "/fixture/manage-taskboard/SKILL.md",
+    tomatoWorkboardSkillPath: "/fixture/tomato-workboard/SKILL.md",
     processEnv: {
       ...process.env,
       FAKE_CAPTURE_PATH: capturePath,
       FAKE_DESCENDANT_PATH: descendantPath,
     },
     killGraceMs: 50,
+    readGitBranch: async () => gitBranch,
+    readCodexThreadModel: async (_codexStatePath, threadId) => (
+      codexThreadModels.get(threadId) ?? null
+    ),
+    setCodexThreadName: async (input) => {
+      nativeThreadNames.push(input);
+    },
   });
   return {
     capturePath,
@@ -156,8 +222,15 @@ if (args[0] === "app-server") {
     databasePath,
     descendantPath,
     directory,
+    nativeThreadNames,
     otherWorkspace,
     service,
+    setGitBranch(branch) {
+      gitBranch = branch;
+    },
+    setCodexThreadModel(threadId, model) {
+      codexThreadModels.set(threadId, model);
+    },
     workspace,
     async close() {
       await this.service.close();
@@ -183,7 +256,6 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
 
     const thread = await fixture.service.createThread({
       projectId: "project",
-      model: "gpt-real",
       reasoningEffort: "high",
       sandbox: "workspace-write",
     });
@@ -208,7 +280,8 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
       "-",
     ]);
     assert.equal(captures[0].args.join(" ").includes("HIDDEN_SENTINEL"), false);
-    assert.match(captures[0].prompt, /\[\$manage-taskboard\]\(\/fixture\/manage-taskboard\/SKILL\.md\) e-taskboard/);
+    assert.equal(captures[1].args.includes("-m"), false);
+    assert.equal(captures[0].prompt.includes("tomato-workboard"), false);
     assert.match(captures[0].prompt, /\$real-skill/);
     assert.match(captures[0].prompt, /HIDDEN_SENTINEL first/);
     assert.deepEqual(captures[1].args, [
@@ -235,6 +308,75 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
     );
     assert.equal(persisted.includes("<taskboard_context>"), false);
     assert.equal(persisted.includes("SECRET REASONING"), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("AI conversations persist the working branch and refresh it after a turn changes branches", async () => {
+  const fixture = await createFixture();
+  try {
+    const thread = await fixture.service.createThread({ projectId: "project" });
+    assert.equal(thread.gitBranch, "main");
+
+    const run = await fixture.service.startTurn(thread.id, { message: "WAIT switch branch" });
+    fixture.setGitBranch("feat/proxima-55150");
+    await waitFor(() => fixture.service.getRun(run.id)?.status !== "running");
+
+    assert.equal(fixture.service.getThread(thread.id).gitBranch, "feat/proxima-55150");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("Tomato conversations use the real item key instead of the local task identifier", async () => {
+  const fixture = await createFixture();
+  try {
+    fixture.database.createProject({
+      id: "tomato",
+      name: "番茄工作台",
+      workspacePath: fixture.workspace,
+    });
+    fixture.database.syncTomatoItems([{
+      itemKey: "proxima-55150",
+      title: "真实番茄卡片",
+      status: "修复中",
+      itemType: "测试缺陷",
+      workspace: "Gitee-Team",
+      priority: "P1",
+    }]);
+    const task = fixture.database.listTasks("tomato")[0];
+    const thread = await fixture.service.createThread({
+      projectId: "tomato",
+      issueId: task.id,
+    });
+    assert.equal(task.identifier, "TOMATO-1");
+    assert.equal(thread.id, "tomato:proxima-55150");
+    assert.equal(thread.title, "proxima-55150 真实番茄卡片");
+    assert.equal(thread.origin.issueIdentifier, "proxima-55150");
+    assert.equal(thread.origin.issueId, task.id);
+    const sameThread = await fixture.service.createThread({
+      projectId: "tomato",
+      issueId: task.id,
+    });
+    assert.equal(sameThread.id, thread.id);
+    assert.equal(fixture.service.listThreads({ issueIdentifier: "proxima-55150" }).length, 1);
+    fixture.database.updateAiChatThread(thread.id, {
+      codexThreadId: "codex-thread-tomato",
+      title: "proxima-55150",
+    });
+    assert.equal(
+      await fixture.service.syncNativeThreadName("codex-thread-tomato"),
+      "proxima-55150 真实番茄卡片",
+    );
+    assert.equal(fixture.service.getThread(thread.id).title, "proxima-55150 真实番茄卡片");
+    assert.deepEqual(fixture.nativeThreadNames.at(-1), {
+      codexExecutable: fixture.service.codexExecutable,
+      workspacePath: fixture.workspace,
+      processEnv: fixture.service.processEnv,
+      threadId: "codex-thread-tomato",
+      name: "proxima-55150 真实番茄卡片",
+    });
   } finally {
     await fixture.close();
   }
@@ -330,17 +472,13 @@ test("protocol terminal events determine run success and item errors remain non-
   }
 });
 
-test("startTurn revalidates the latest danger sandbox and persisted model settings", async () => {
+test("startTurn revalidates the latest danger sandbox and reasoning settings", async () => {
   const fixture = await createFixture();
   try {
     for (const scenario of [
       {
         changes: { sandbox: "danger-full-access" },
         expectedCode: "DANGER_CONFIRMATION_REQUIRED",
-      },
-      {
-        changes: { model: "retired-model" },
-        expectedCode: "INVALID_MODEL",
       },
       {
         changes: { reasoningEffort: "ultra" },
@@ -391,7 +529,7 @@ test("startup marks abandoned runs interrupted while preserving the Codex thread
     database: fixture.database,
     codexExecutable: path.join(fixture.directory, "fake-codex.mjs"),
     codexStatePath: path.join(fixture.directory, "codex-state.json"),
-    manageTaskboardSkillPath: "/fixture/manage-taskboard/SKILL.md",
+    tomatoWorkboardSkillPath: "/fixture/tomato-workboard/SKILL.md",
   });
   fixture.service = restarted;
   try {

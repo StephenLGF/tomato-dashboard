@@ -17,6 +17,29 @@ function now() {
   return new Date().toISOString();
 }
 
+export function tomatoItemKey(description) {
+  return typeof description === "string"
+    ? description.match(/(?:^|\n)番茄事项：([^\n]+)/)?.[1]?.trim() ?? ""
+    : "";
+}
+
+function tomatoTaskStatus(status) {
+  if (["测试通过", "测试完成", "已完成", "已关闭"].includes(status)) return "done";
+  if (["已取消", "不修复"].includes(status)) return "canceled";
+  if (["阻塞", "已挂起", "延期", "延期解决"].includes(status)) return "blocked";
+  if (["Bugfix", "修复中", "待测试", "测试中", "开发中"].includes(status)) return "in_progress";
+  if (status === "新建") return "todo";
+  return "backlog";
+}
+
+function tomatoTaskPriority(priority) {
+  if (priority === "P0") return "urgent";
+  if (priority === "P1") return "high";
+  if (priority === "P2") return "medium";
+  if (priority === "P3" || priority === "P4") return "low";
+  return "none";
+}
+
 function taskFromRow(row) {
   const developmentContext = row.worktree_path
     ? { type: "worktree", path: row.worktree_path, branch: row.worktree_branch }
@@ -45,6 +68,10 @@ function taskFromRow(row) {
       avatarUrl: row.assignee_avatar_url,
     },
     workflowId: row.workflow_id,
+    repositoryProjectId: row.repository_project_id ?? null,
+    rebaseBranch: row.rebase_branch ?? null,
+    tomatoRepositories: row.tomato_repositories ? JSON.parse(row.tomato_repositories) : [],
+    tomatoAnalysisDisabled: row.tomato_analysis_disabled === 1,
     developmentContext,
     dueDate: row.due_date,
     recurrence: row.recurrence_interval && row.recurrence_unit
@@ -54,6 +81,17 @@ function taskFromRow(row) {
     version: row.version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    tomatoAnalysis: row.tomato_analysis_status
+      ? {
+          status: row.tomato_analysis_status,
+          analyzedAt: row.tomato_analysis_at,
+          summary: row.tomato_analysis_summary ?? "",
+          repairPlan: row.tomato_analysis_plan ?? "",
+          decision: row.tomato_analysis_decision ?? null,
+          missingInformation: row.tomato_analysis_missing ?? null,
+          evidenceKey: row.tomato_analysis_evidence_key ?? null,
+        }
+      : null,
   };
 }
 
@@ -149,7 +187,7 @@ function aiChatThreadFromRow(row) {
       ...(row.origin_issue_identifier ? { issueIdentifier: row.origin_issue_identifier } : {}),
     },
     codexThreadId: row.codex_thread_id,
-    model: row.model,
+    gitBranch: row.git_branch,
     reasoningEffort: row.reasoning_effort,
     sandbox: row.sandbox,
     currentRun: null,
@@ -218,12 +256,23 @@ export class TaskboardDatabase {
         assignee_name TEXT NOT NULL DEFAULT '本地用户',
         assignee_avatar_url TEXT,
         workflow_id TEXT,
+        repository_project_id TEXT,
+        rebase_branch TEXT,
+        tomato_repositories TEXT,
+        tomato_analysis_disabled INTEGER NOT NULL DEFAULT 0,
         git_branch TEXT,
         worktree_path TEXT,
         worktree_branch TEXT,
         due_date TEXT,
         recurrence_interval INTEGER,
         recurrence_unit TEXT,
+        tomato_analysis_status TEXT CHECK (tomato_analysis_status IN ('fixable', 'needs_human', 'insufficient')),
+        tomato_analysis_at TEXT,
+        tomato_analysis_summary TEXT,
+        tomato_analysis_plan TEXT,
+        tomato_analysis_decision TEXT,
+        tomato_analysis_missing TEXT,
+        tomato_analysis_evidence_key TEXT,
         archived_at TEXT,
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
@@ -280,7 +329,7 @@ export class TaskboardDatabase {
         origin_issue_id TEXT,
         origin_issue_identifier TEXT,
         codex_thread_id TEXT,
-        model TEXT NOT NULL,
+        git_branch TEXT,
         reasoning_effort TEXT NOT NULL,
         sandbox TEXT NOT NULL CHECK (sandbox IN (
           'read-only', 'workspace-write', 'danger-full-access'
@@ -291,6 +340,12 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS ai_chat_threads_updated
         ON ai_chat_threads(updated_at DESC, id);
+
+      CREATE INDEX IF NOT EXISTS ai_chat_threads_issue_identifier
+        ON ai_chat_threads(origin_issue_identifier, updated_at DESC, id);
+
+      CREATE INDEX IF NOT EXISTS ai_chat_threads_project_updated
+        ON ai_chat_threads(origin_project_id, updated_at DESC, id);
 
       CREATE TABLE IF NOT EXISTS ai_chat_runs (
         id TEXT PRIMARY KEY,
@@ -363,6 +418,13 @@ export class TaskboardDatabase {
     if (!taskColumns.some((column) => column.name === "recurrence_unit")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN recurrence_unit TEXT");
     }
+    const aiChatThreadColumns = this.database.prepare("PRAGMA table_info(ai_chat_threads)").all();
+    if (!aiChatThreadColumns.some((column) => column.name === "git_branch")) {
+      this.database.exec("ALTER TABLE ai_chat_threads ADD COLUMN git_branch TEXT");
+    }
+    if (aiChatThreadColumns.some((column) => column.name === "model")) {
+      this.database.exec("ALTER TABLE ai_chat_threads DROP COLUMN model");
+    }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
     if (!migratedTaskColumns.some((column) => column.name === "creator_type")) {
@@ -379,6 +441,31 @@ export class TaskboardDatabase {
     }
     if (!migratedTaskColumns.some((column) => column.name === "workflow_id")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN workflow_id TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "repository_project_id")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN repository_project_id TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "rebase_branch")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN rebase_branch TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "tomato_repositories")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN tomato_repositories TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "tomato_analysis_disabled")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN tomato_analysis_disabled INTEGER NOT NULL DEFAULT 0");
+    }
+    const tomatoAnalysisColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
+    const tomatoAnalysisMigrations = [
+      ["tomato_analysis_status", "TEXT CHECK (tomato_analysis_status IN ('fixable', 'needs_human', 'insufficient'))"],
+      ["tomato_analysis_at", "TEXT"],
+      ["tomato_analysis_summary", "TEXT"],
+      ["tomato_analysis_plan", "TEXT"],
+      ["tomato_analysis_decision", "TEXT"],
+      ["tomato_analysis_missing", "TEXT"],
+      ["tomato_analysis_evidence_key", "TEXT"],
+    ].filter(([column]) => !tomatoAnalysisColumns.some((current) => current.name === column));
+    for (const [column, definition] of tomatoAnalysisMigrations) {
+      this.database.exec(`ALTER TABLE tasks ADD COLUMN ${column} ${definition}`);
     }
     this.database.exec(`
       UPDATE tasks
@@ -487,6 +574,43 @@ export class TaskboardDatabase {
       VALUES ('local', 'Local', NULL, 1, ?, ?)
       ON CONFLICT(id) DO NOTHING
     `).run(timestamp, timestamp);
+    this.database.prepare(`
+      INSERT INTO projects (id, name, workspace_path, next_task_number, created_at, updated_at)
+      VALUES ('tomato', '番茄', NULL, 1, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `).run(timestamp, timestamp);
+    this.#migrateTomatoAiChatIdentifiers();
+  }
+
+  #migrateTomatoAiChatIdentifiers() {
+    const rows = this.database.prepare(`
+      SELECT
+        ai_chat_threads.id,
+        ai_chat_threads.title,
+        ai_chat_threads.origin_issue_identifier,
+        tasks.identifier AS task_identifier,
+        tasks.title AS task_title,
+        tasks.description AS task_description
+      FROM ai_chat_threads
+      INNER JOIN tasks ON tasks.id = ai_chat_threads.origin_issue_id
+      WHERE tasks.project_id = 'tomato'
+    `).all();
+    const update = this.database.prepare(`
+      UPDATE ai_chat_threads
+      SET title = ?, origin_issue_identifier = ?
+      WHERE id = ?
+    `);
+    for (const row of rows) {
+      const itemKey = tomatoItemKey(row.task_description);
+      if (!itemKey) continue;
+      const taskTitle = String(row.task_title ?? "")
+        .replace(/^\[[^\]]+\]\s*/u, "")
+        .trim();
+      const title = `${itemKey}${taskTitle ? ` ${taskTitle}` : ""}`;
+      const issueIdentifier = itemKey;
+      if (title === row.title && issueIdentifier === row.origin_issue_identifier) continue;
+      update.run(title, issueIdentifier, row.id);
+    }
   }
 
   close() {
@@ -677,11 +801,32 @@ export class TaskboardDatabase {
     return this.getWorkflowWorkspace(projectId);
   }
 
-  listAiChatThreads() {
+  listAiChatThreads({ issueId, issueIdentifier, projectId } = {}) {
+    const filter = issueIdentifier
+      ? { where: "WHERE origin_issue_identifier = ?", value: issueIdentifier }
+      : issueId
+        ? { where: "WHERE origin_issue_id = ?", value: issueId }
+        : projectId
+          ? projectId === "tomato"
+            ? {
+                where: `WHERE origin_project_id = ? OR origin_issue_id IN (
+                  SELECT id FROM tasks WHERE project_id = ?
+                )`,
+                value: [projectId, projectId],
+              }
+            : { where: "WHERE origin_project_id = ?", value: projectId }
+          : { where: "", value: null };
     return this.database.prepare(`
       SELECT * FROM ai_chat_threads
+      ${filter.where}
       ORDER BY updated_at DESC, id
-    `).all().map((row) => this.#aiChatThreadWithCurrentRun(row));
+    `).all(...(
+      Array.isArray(filter.value)
+        ? filter.value
+        : filter.value
+          ? [filter.value]
+          : []
+    )).map((row) => this.#aiChatThreadWithCurrentRun(row));
   }
 
   getAiChatThread(id) {
@@ -697,7 +842,7 @@ export class TaskboardDatabase {
         id, title, status,
         origin_project_id, origin_project_name, origin_workspace_path,
         origin_issue_id, origin_issue_identifier,
-        codex_thread_id, model, reasoning_effort, sandbox,
+        codex_thread_id, git_branch, reasoning_effort, sandbox,
         created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
@@ -710,7 +855,7 @@ export class TaskboardDatabase {
       input.origin.issueId ?? null,
       input.origin.issueIdentifier ?? null,
       input.codexThreadId ?? null,
-      input.model,
+      input.gitBranch ?? null,
       input.reasoningEffort,
       input.sandbox,
       timestamp,
@@ -728,7 +873,8 @@ export class TaskboardDatabase {
       title: "title",
       status: "status",
       codexThreadId: "codex_thread_id",
-      model: "model",
+      gitBranch: "git_branch",
+      originIssueIdentifier: "origin_issue_identifier",
       reasoningEffort: "reasoning_effort",
       sandbox: "sandbox",
     };
@@ -887,7 +1033,7 @@ export class TaskboardDatabase {
         UPDATE ai_chat_runs
         SET
           status = 'interrupted',
-          error = COALESCE(error, 'Taskboard service restarted'),
+          error = COALESCE(error, '工作台服务已重启'),
           finished_at = COALESCE(finished_at, ?)
         WHERE status = 'running'
       `).run(timestamp);
@@ -946,6 +1092,205 @@ export class TaskboardDatabase {
         id
     `;
     return this.database.prepare(sql).all(...values).map((row) => this.#taskWithRelations(row));
+  }
+
+  syncTomatoItems(items) {
+    const project = this.database.prepare(`
+      SELECT id, next_task_number FROM projects WHERE id = 'tomato'
+    `).get();
+    if (!project) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", "Project 'tomato' does not exist");
+    }
+
+    const existingRows = this.database.prepare(`
+      SELECT * FROM tasks WHERE project_id = 'tomato'
+    `).all();
+    const existingByKey = new Map();
+    for (const row of existingRows) {
+      const itemKey = tomatoItemKey(row.description);
+      if (!itemKey) continue;
+      if (existingByKey.has(itemKey)) {
+        throw new ApiError(409, "DUPLICATE_TOMATO_ITEM", `Multiple local cards use Tomato item '${itemKey}'`);
+      }
+      existingByKey.set(itemKey, row);
+    }
+
+    const timestamp = now();
+    let nextTaskNumber = Number(project.next_task_number);
+    let created = 0;
+    let updated = 0;
+    let archived = 0;
+    const seen = new Set();
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      for (const [index, item] of items.entries()) {
+        seen.add(item.itemKey);
+        const title = `[${item.itemKey}] ${item.title}`;
+        const description = [
+          `番茄事项：${item.itemKey}`,
+          `类型：${item.itemType}`,
+          `当前状态：${item.status}`,
+          `工作区：${item.workspace}`,
+        ].join("\n");
+        const status = tomatoTaskStatus(item.status);
+        const priority = tomatoTaskPriority(item.priority);
+        const labels = JSON.stringify(["tomato", item.itemType, item.status, item.workspace]);
+        const creatorName = item.creator || "未知";
+        const creatorId = item.creator || "tomato-user";
+        const sortOrder = (index + 1) * 1000;
+        const existing = existingByKey.get(item.itemKey);
+
+        if (existing) {
+          const changed = existing.title !== title
+            || existing.description !== description
+            || existing.status !== status
+            || existing.priority !== priority
+            || existing.labels !== labels
+            || existing.creator_id !== creatorId
+            || existing.creator_name !== creatorName
+            || existing.sort_order !== sortOrder
+            || existing.archived_at !== null;
+          if (!changed) continue;
+          this.database.prepare(`
+            UPDATE tasks
+            SET title = ?, description = ?, status = ?, priority = ?, labels = ?, sort_order = ?,
+                creator_type = 'user', creator_id = ?, creator_name = ?, creator_avatar_url = NULL,
+                archived_at = NULL, version = version + 1, updated_at = ?
+            WHERE id = ?
+          `).run(
+            title,
+            description,
+            status,
+            priority,
+            labels,
+            sortOrder,
+            creatorId,
+            creatorName,
+            timestamp,
+            existing.id,
+          );
+          updated += 1;
+          continue;
+        }
+
+        const id = randomUUID();
+        const identifier = `${projectPrefix(project.id)}-${nextTaskNumber++}`;
+        this.database.prepare(`
+          INSERT INTO tasks (
+            id, identifier, project_id, title, description, status, priority, labels,
+            sort_order, thread_id, creator_type, creator_id, creator_name, creator_avatar_url,
+            assignee_type, assignee_id, assignee_name, assignee_avatar_url,
+            workflow_id, git_branch, worktree_path, worktree_branch,
+            due_date, recurrence_interval, recurrence_unit,
+            archived_at, version, created_at, updated_at
+          ) VALUES (?, ?, 'tomato', ?, ?, ?, ?, ?, ?, NULL, 'user', ?, ?, NULL,
+                    'user', 'local-user', '本地用户', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                    NULL, 1, ?, ?)
+        `).run(
+          id,
+          identifier,
+          title,
+          description,
+          status,
+          priority,
+          labels,
+          sortOrder,
+          creatorId,
+          creatorName,
+          timestamp,
+          timestamp,
+        );
+        created += 1;
+      }
+
+      for (const [itemKey, row] of existingByKey) {
+        if (seen.has(itemKey) || row.archived_at !== null) continue;
+        this.database.prepare(`
+          UPDATE tasks
+          SET archived_at = ?, version = version + 1, updated_at = ?
+          WHERE id = ?
+        `).run(timestamp, timestamp, row.id);
+        archived += 1;
+      }
+
+      this.database.prepare(`
+        UPDATE projects SET next_task_number = ?, updated_at = ? WHERE id = 'tomato'
+      `).run(nextTaskNumber, timestamp);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+
+    return { total: items.length, created, updated, archived };
+  }
+
+  listTomatoAnalysisCandidates() {
+    return this.database.prepare(`
+      SELECT * FROM tasks
+      WHERE project_id = 'tomato'
+        AND archived_at IS NULL
+        AND tomato_analysis_disabled = 0
+        AND tomato_analysis_status IS NULL
+        AND (description LIKE '%类型：Bug%' OR description LIKE '%类型：测试缺陷%')
+        AND (description LIKE '%当前状态：新建%' OR description LIKE '%当前状态：修复中%')
+      ORDER BY sort_order, created_at, id
+    `).all().map((row) => this.#taskWithRelations(row));
+  }
+
+  saveTomatoAnalysis(itemKey, analysis) {
+    const row = this.database.prepare(`
+      SELECT * FROM tasks
+      WHERE project_id = 'tomato' AND archived_at IS NULL
+    `).all().find((candidate) => tomatoItemKey(candidate.description) === itemKey);
+    if (!row) throw new ApiError(404, "TOMATO_ITEM_NOT_FOUND", `Tomato item '${itemKey}' is not on the board`);
+    if (row.tomato_analysis_status === "fixable") return this.#taskWithRelations(row);
+    if (
+      row.tomato_analysis_status
+      && row.tomato_analysis_evidence_key
+      && row.tomato_analysis_evidence_key === analysis.evidenceKey
+    ) return this.#taskWithRelations(row);
+    const eligibleType = /(?:^|\n)类型：(Bug|测试缺陷)(?:\n|$)/.test(row.description);
+    const eligibleStatus = /(?:^|\n)当前状态：(新建|修复中)(?:\n|$)/.test(row.description);
+    if (!eligibleType || !eligibleStatus) {
+      throw new ApiError(409, "TOMATO_ITEM_NOT_ELIGIBLE", `Tomato item '${itemKey}' is no longer eligible for analysis`);
+    }
+    const timestamp = now();
+    this.database.prepare(`
+      UPDATE tasks
+      SET tomato_analysis_status = ?, tomato_analysis_at = ?, tomato_analysis_summary = ?,
+          tomato_analysis_plan = ?, tomato_analysis_decision = ?, tomato_analysis_missing = ?,
+          tomato_analysis_evidence_key = ?,
+          version = version + 1, updated_at = ?
+      WHERE id = ? AND (tomato_analysis_status IS NULL OR tomato_analysis_status != 'fixable')
+    `).run(
+      analysis.status,
+      timestamp,
+      analysis.summary,
+      analysis.repairPlan,
+      analysis.decision,
+      analysis.missingInformation,
+      analysis.evidenceKey,
+      timestamp,
+      row.id,
+    );
+    return this.getTask(row.id);
+  }
+
+  setTomatoAnalysisDisabled(itemKey, disabled) {
+    const row = this.database.prepare(`
+      SELECT * FROM tasks
+      WHERE project_id = 'tomato' AND archived_at IS NULL
+    `).all().find((candidate) => tomatoItemKey(candidate.description) === itemKey);
+    if (!row) throw new ApiError(404, "TOMATO_ITEM_NOT_FOUND", `Tomato item '${itemKey}' is not on the board`);
+    const timestamp = now();
+    this.database.prepare(`
+      UPDATE tasks
+      SET tomato_analysis_disabled = ?, version = version + 1, updated_at = ?
+      WHERE id = ?
+    `).run(disabled ? 1 : 0, timestamp, row.id);
+    return this.getTask(row.id);
   }
 
   getTask(id) {
@@ -1042,6 +1387,10 @@ export class TaskboardDatabase {
       priority: "priority",
       labels: "labels",
       workflowId: "workflow_id",
+      repositoryProjectId: "repository_project_id",
+      rebaseBranch: "rebase_branch",
+      tomatoRepositories: "tomato_repositories",
+      tomatoAnalysisDisabled: "tomato_analysis_disabled",
       dueDate: "due_date",
     };
     const assignments = [];
@@ -1072,7 +1421,7 @@ export class TaskboardDatabase {
         continue;
       }
       assignments.push(`${columns[key]} = ?`);
-      values.push(key === "labels" ? JSON.stringify(value) : value);
+      values.push(key === "labels" || key === "tomatoRepositories" ? JSON.stringify(value) : value);
     }
     if (threadId !== undefined) {
       assignments.push("thread_id = ?");

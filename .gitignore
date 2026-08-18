@@ -1,10 +1,15 @@
 node_modules/
 dist/
 .data/
-.wrangler/
+.env
+.env.*
+!.env.example
 .dev.vars*
 .tmp/
-cloud-migration-exports/
 .playwright-cli/
+output/
+test-results/
+*-proof.png
+linear-*-proof.png
 *.log
 .DS_Store

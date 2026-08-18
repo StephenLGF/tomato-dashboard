@@ -146,7 +146,7 @@ test("turn input cannot contain cwd, hidden context, model overrides or arbitrar
     skillIds: ["cloudflare"],
   });
   assert.equal(JSON.stringify(input).includes("workspacePath"), false);
-  assert.equal(JSON.stringify(input).includes("manage-taskboard"), false);
+  assert.equal(JSON.stringify(input).includes("tomato-workboard"), false);
   assert.equal(JSON.stringify(input).includes("model"), false);
   assert.deepEqual(buildTurnInput("执行", [], true), {
     message: "执行",
@@ -243,6 +243,18 @@ test("activity status treats started, running and in_progress as active and fail
     content: "",
     data: { status: "completed" },
   }), "completed");
+  assert.equal(aiChatEventStatus({
+    id: "5",
+    type: "error",
+    role: "error",
+    content: "This session was recorded with model `gpt-5.6-sol` but is resuming with `gpt-5.6-luna`. Consider switching back.",
+  }), "completed");
+  assert.equal(aiChatEventStatus({
+    id: "6",
+    type: "error",
+    role: "error",
+    content: "Your access token could not be refreshed",
+  }), "failed");
 });
 
 test("snapshot hint refreshes allow one in-flight request and one queued request", async () => {

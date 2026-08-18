@@ -4,54 +4,10 @@ import { test } from "node:test";
 import {
   findResidentInjectorPids,
   handleHostBindingPayload,
+  pruneStaleHostConnections,
   reconcileInjectionRuntime,
   restartResidentInjector,
 } from "../scripts/codex-injector-runtime.mjs";
-
-const currentAutomationRequest = {
-  id: "host-request-1",
-  action: "automation",
-  requestId: "automation-request-1",
-  operation: "ensure-active",
-  taskboardProjectId: "local",
-  codexProjectId: "codex-project",
-  projectName: "Local",
-  workspacePath: "/tmp/project",
-  skillPath: "/tmp/manage-taskboard/SKILL.md",
-  intervalMinutes: 10,
-  model: "gpt-5.6-sol",
-  reasoningEffort: "ultra",
-};
-
-test("a stale automation parser receives an immediate host error instead of timing out", async () => {
-  const responses = [];
-  const staleParser = () => null;
-
-  const result = await Promise.race([
-    handleHostBindingPayload(
-      {
-        payload: JSON.stringify(currentAutomationRequest),
-        executionContextId: 12,
-      },
-      {
-        parseAutomationRequest: staleParser,
-        ensure: async () => assert.fail("ensure must not run"),
-        runAutomation: async () => assert.fail("automation must not run"),
-        prefill: async () => assert.fail("prefill must not run"),
-        sendResponse: async (_executionContextId, response) => responses.push(response),
-      },
-    ),
-    new Promise((_, reject) => setTimeout(() => reject(new Error("host response timed out")), 50)),
-  ]);
-
-  assert.deepEqual(result, { responded: true, accepted: false });
-  assert.deepEqual(responses, [{
-    id: currentAutomationRequest.id,
-    ok: false,
-    error: "自动认领配置暂时无法应用，请刷新后重试",
-    diagnosticCode: "AUTOMATION_SCHEMA_MISMATCH",
-  }]);
-});
 
 test("attach replaces an old runtime with the current source and restores an open page", async () => {
   const calls = [];
@@ -184,4 +140,26 @@ test("refresh stops every stale resident before starting one token-verified repl
     ["start", 9231, startupToken],
     ["ready", 9231, 9876, startupToken],
   ]);
+});
+
+test("a hung renderer heartbeat is removed so a restarted Codex target can be injected", async () => {
+  const closed = [];
+  const liveConnection = { close: () => assert.fail("live connection must stay open") };
+  const staleConnection = { close: () => closed.push("stale") };
+  const connections = new Map([
+    ["live-target", liveConnection],
+    ["stale-target", staleConnection],
+  ]);
+
+  const staleIds = await pruneStaleHostConnections(
+    connections,
+    async (connection) => {
+      if (connection === staleConnection) await new Promise(() => {});
+    },
+    5,
+  );
+
+  assert.deepEqual(staleIds, ["stale-target"]);
+  assert.deepEqual([...connections.keys()], ["live-target"]);
+  assert.deepEqual(closed, ["stale"]);
 });

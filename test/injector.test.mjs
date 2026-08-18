@@ -41,25 +41,8 @@ test("the CDP bridge accepts only service ensure and native Skill composer prefi
   assert.match(source, /__codexTaskboardHostHeartbeatV1/);
 });
 
-test("the CDP bridge exposes only the fixed Taskboard automation operations", () => {
-  assert.match(source, /parseTaskboardAutomationHostRequest/);
-  assert.match(source, /reconcileTaskboardAutomation/);
-  assert.match(runtimeSource, /request\.action === "automation"/);
-  assert.match(source, /function requestCodexAutomationViaCdp/);
-  assert.match(source, /new Set\(\[\s*"list-automations",\s*"automation-create",\s*"automation-update",\s*\]\)/);
-  assert.match(source, /bridge\.sendMessageFromView\(\{\s*type: "fetch",\s*requestId,/);
-  assert.match(source, /method: "POST"/);
-  assert.match(source, /vscode:\/\/codex\/\$\{method\}/);
-  assert.match(source, /body: JSON\.stringify\(params\)/);
-  assert.match(source, /message\.type !== "fetch-response"/);
-  assert.match(source, /message\.responseType/);
-  assert.match(source, /message\.status/);
-  assert.match(source, /message\.bodyJsonString/);
-  assert.doesNotMatch(source, /automation-delete/);
-  assert.doesNotMatch(source, /automations\.toml/);
-});
-
 test("the package injection command remains resident for tab-triggered recovery", () => {
+  assert.match(packageJson.scripts.codex, /--launch --watch --open/);
   assert.match(packageJson.scripts["codex:inject"], /--watch/);
   assert.match(packageJson.scripts["codex:daemon"], /--daemon --open/);
   assert.match(source, /function startResidentInjector/);
@@ -67,6 +50,18 @@ test("the package injection command remains resident for tab-triggered recovery"
   assert.match(source, /port: defaultCodexDebuggingPort/);
   assert.match(source, /--startup-token/);
   assert.match(source, /__codexTaskboardHostStartupTokenV1/);
+  assert.match(source, /while \(!cdpReachable && codexIsRunning\(\)\)/);
+  assert.match(source, /const hostHeartbeatIntervalMs = 5_000/);
+  assert.match(source, /const results = injectedTargets\.size === 0/);
+  assert.match(source, /if \(options\.launch && !\(await isReachable\(cdpVersionUrl\)\)\) break/);
+  assert.match(source, /async function waitForCodexRenderer/);
+  assert.match(source, /await waitForCodexRenderer\(options\.port, 30_000\)/);
+  assert.match(source, /const applicationName = path\.basename\(appPath, path\.extname\(appPath\)\)/);
+  assert.match(source, /"-n",\s*"-W",\s*"-a",\s*applicationName,\s*"--args"/);
+  assert.match(source, /Taskboard launch failed; restoring a normal Codex window/);
+  assert.match(source, /async function restoreNormalCodex/);
+  assert.match(source, /async function waitForCodexBootstrap/);
+  assert.match(source, /await waitForCodexBootstrap\(cdp, 30_000\)/);
 });
 
 test("attach reconciles the renderer against a hashed current injection source", () => {
@@ -79,10 +74,15 @@ test("attach reconciles the renderer against a hashed current injection source",
   assert.match(source, /Page\.addScriptToEvaluateOnNewDocument/);
   assert.match(source, /reconcileInjectionRuntime/);
   assert.match(source, /expectedSourceHash/);
+  assert.match(source, /const requiresCspReload = !currentStatus\.sourceHash/);
+  assert.match(
+    source,
+    /if \(requiresCspReload\) \{[\s\S]*?cdp\.send\("Page\.reload"\)[\s\S]*?publishInjectionScriptIdentifier/,
+  );
 });
 
 test("the injector ignores auxiliary Codex windows", () => {
-  assert.match(source, /!target\.url\?\.includes\("initialRoute=%2Fglobal-dictation"\)/);
+  assert.match(source, /target\.url === "app:\/\/-\/index\.html"/);
 });
 
 test("a completed web build refreshes an already-open Codex iframe", () => {

@@ -44,7 +44,7 @@ if (args[0] === "debug") {
     dataDirectory: directory,
     codexExecutable,
     codexStatePath,
-    skillPath: "/fixture/manage-taskboard/SKILL.md",
+    skillPath: "/fixture/tomato-workboard/SKILL.md",
   });
   const address = await app.listen({ host, port: 0 });
   return {
@@ -123,7 +123,6 @@ test("loopback AI API freezes server-owned origin and rejects injected execution
       method: "POST",
       body: {
         projectId: "local",
-        model: "gpt-real",
         reasoningEffort: "high",
         sandbox: "read-only",
       },
@@ -166,7 +165,6 @@ test("danger-full-access requires confirmation on every turn and thread settings
       method: "POST",
       body: {
         projectId: "local",
-        model: "gpt-real",
         reasoningEffort: "low",
         sandbox: "danger-full-access",
       },
@@ -187,10 +185,10 @@ test("danger-full-access requires confirmation on every turn and thread settings
 
     const invalidModel = await request(fixture.baseUrl, `/api/local/ai/threads/${threadId}`, {
       method: "PATCH",
-      body: { model: "invented-model", reasoningEffort: "high" },
+      body: { model: "invented-model" },
     });
     assert.equal(invalidModel.response.status, 400);
-    assert.equal(invalidModel.body.error.code, "INVALID_MODEL");
+    assert.equal(invalidModel.body.error.code, "UNKNOWN_FIELD");
   } finally {
     await fixture.close();
   }

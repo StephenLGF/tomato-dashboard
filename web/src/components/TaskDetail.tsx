@@ -1128,10 +1128,43 @@ export function TaskDetail({
                 () => onRemoveRelation(anchor, type, relatedTaskId),
               )}
             />
-            <div className="detail-timestamps">
-              <span>创建于 {exactTime(currentTask.createdAt)}</span>
-              {currentTask.updatedAt !== currentTask.createdAt && <span>更新于 {exactTime(currentTask.updatedAt)}</span>}
-            </div>
+            <section className="detail-metadata" aria-labelledby="detail-metadata-heading">
+              <h2 id="detail-metadata-heading">详细信息</h2>
+              <dl>
+                <div>
+                  <dt>任务编号</dt>
+                  <dd>{currentTask.identifier}</dd>
+                </div>
+                <div>
+                  <dt>创建者</dt>
+                  <dd title={`@${currentTask.creatorId}`}>{currentTask.creatorName}</dd>
+                </div>
+                <div>
+                  <dt>项目</dt>
+                  <dd title={currentTask.projectId}>{currentTask.projectId}</dd>
+                </div>
+                <div>
+                  <dt>评论</dt>
+                  <dd>{comments.length}</dd>
+                </div>
+                <div>
+                  <dt>附件</dt>
+                  <dd>{attachments.length}</dd>
+                </div>
+                <div>
+                  <dt>版本</dt>
+                  <dd>{currentTask.version}</dd>
+                </div>
+                <div>
+                  <dt>创建时间</dt>
+                  <dd>{exactTime(currentTask.createdAt)}</dd>
+                </div>
+                <div>
+                  <dt>更新时间</dt>
+                  <dd>{exactTime(currentTask.updatedAt)}</dd>
+                </div>
+              </dl>
+            </section>
           </aside>
         </div>
       </div>

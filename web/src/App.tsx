@@ -11,30 +11,42 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react";
-import {
-  isAutomationModel,
-  isAutomationReasoningEffort,
-  isSupportedModelEffort,
-  type AutomationModel,
-  type AutomationReasoningEffort,
-} from "../../shared/taskboard-automation-options.mjs";
+// @ts-expect-error Shared runtime constants are verified by focused node tests.
+import { isVisibleTomatoStatus } from "../../shared/tomato-statuses.mjs";
+// @ts-expect-error Shared Tomato identity parsing is verified by focused node tests.
+import { tomatoItemKeyFromTask } from "../../shared/tomato-url.mjs";
 import {
   ApiError,
+  createAiChatThread,
   addTaskRelation,
   archiveTask as archiveTaskRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
+  getTomatoAnalysisProgress,
+  getTomatoSession,
+  loginTomato,
+  switchTomatoContext,
+  getAiChatThread,
   getTaskboardRevision,
   getWorkflowWorkspace,
   getTaskboardMetadata,
+  listCodexRepositories,
   listDevelopmentContexts,
   listDeviceWorkspaces,
+  listAiChatThreadsForProject,
   listProjects,
   listTasks,
+  interruptAiChatRun,
   moveTask as moveTaskRequest,
+  openCodexThread as openCodexThreadRequest,
   removeTaskRelation,
   restoreTask as restoreTaskRequest,
+  setTomatoAnalysisProgress,
+  setTomatoAnalysisDisabled,
   setCurrentUserActor,
+  syncTomatoItems,
+  type TomatoSession,
+  startAiChatTurn,
   uploadAttachment,
   updateTask as updateTaskRequest,
 } from "./api";
@@ -43,7 +55,8 @@ import {
   assigneeTargetForActor,
 } from "./actors";
 import { BoardColumn, STATUS_DETAILS } from "./components/BoardColumn";
-import { AiChat } from "./components/AiChat";
+import { TomatoStatusColumn } from "./components/TomatoStatusColumn";
+import { AiChat, type AiChatHandle } from "./components/AiChat";
 import { BoardSettingsMenu } from "./components/BoardSettingsMenu";
 import { HiddenColumns } from "./components/HiddenColumns";
 import {
@@ -51,12 +64,13 @@ import {
   type PendingInlineImage,
 } from "./components/InlineMediaComposer";
 import { LinearIcon } from "./components/LinearIcon";
-import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
 import { TaskEditor } from "./components/TaskEditor";
 import { TaskFilterMenu } from "./components/TaskFilterMenu";
 import { buildIssueUrl, readIssueIdentifier } from "./issueRoute";
+import { TomatoTaskDetail } from "./components/TomatoTaskDetail";
+import { TomatoLoginPage } from "./components/TomatoLoginPage";
 import { DEFAULT_LABELS } from "./labels";
 import {
   EMPTY_TASK_FILTERS,
@@ -69,6 +83,9 @@ import {
 import {
   TASK_STATUSES,
   type ActorIdentity,
+  type AiChatEvent,
+  type AiChatThread,
+  type CodexRepository,
   type DevelopmentScan,
   type HostContext,
   type IssueRelationType,
@@ -84,14 +101,45 @@ import {
   readLegacyWorkflowWorkspace,
   workflowOptionsFromWorkspace,
 } from "./workflowStore";
-// The poller stays in ESM JavaScript so its lifecycle can be tested directly with node:test.
-// @ts-expect-error The module's option contract is enforced by its focused node tests.
-import { createRevisionPoller, getRevisionPollingInterval } from "./revisionPolling.mjs";
 
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
 type BoardView = "issues" | "workflow";
+const TOMATO_STATUS_ORDER = ["新建", "Bugfix", "修复中", "待测试", "测试中"];
 const SHOW_WORKFLOW_BOARD_ENTRY = false;
+
+function sameTomatoConversationSummary(
+  current: ReadonlyMap<string, AiChatThread[]>,
+  next: ReadonlyMap<string, AiChatThread[]>,
+): boolean {
+  if (current.size !== next.size) return false;
+  for (const [itemKey, nextThreads] of next) {
+    const currentThreads = current.get(itemKey);
+    if (!currentThreads || currentThreads.length !== nextThreads.length) return false;
+    for (let index = 0; index < nextThreads.length; index += 1) {
+      const currentThread = currentThreads[index];
+      const nextThread = nextThreads[index];
+      if (
+        currentThread.id !== nextThread.id
+        || currentThread.status !== nextThread.status
+        || currentThread.codexThreadId !== nextThread.codexThreadId
+        || currentThread.gitBranch !== nextThread.gitBranch
+        || currentThread.origin.workspacePath !== nextThread.origin.workspacePath
+      ) return false;
+    }
+  }
+  return true;
+}
+
+function groupTomatoConversations(threads: AiChatThread[]) {
+  const conversations = new Map<string, AiChatThread[]>();
+  for (const thread of threads) {
+    const itemKey = thread.origin.issueIdentifier;
+    if (!itemKey) continue;
+    conversations.set(itemKey, [...(conversations.get(itemKey) ?? []), thread]);
+  }
+  return conversations;
+}
 
 const WorkflowBoard = lazy(() => import("./components/WorkflowBoard").then((module) => ({
   default: module.WorkflowBoard,
@@ -128,62 +176,6 @@ interface UndoNotice {
 }
 
 type ColumnVisibilityByProject = Record<string, Partial<Record<TaskStatus, boolean>>>;
-type ProjectAutomationStatus = "ACTIVE" | "PAUSED";
-type AutomationQuotaState = "available" | "blocked" | "unknown" | "unavailable";
-type AutomationIntervalMinutes = 5 | 10 | 15 | 30 | 60;
-
-interface AutomationQuotaStatus {
-  state: AutomationQuotaState;
-  checkedAt: number;
-  resetsAt?: number;
-  reason?: "api-key";
-}
-
-interface ProjectAutomationRecord {
-  automationId?: string;
-  codexProjectId: string;
-  status: ProjectAutomationStatus;
-  enabledByUser: boolean;
-  quotaAware: boolean;
-  quota?: AutomationQuotaStatus;
-  intervalMinutes: AutomationIntervalMinutes;
-  model: AutomationModel;
-  reasoningEffort: AutomationReasoningEffort;
-}
-
-type ProjectAutomations = Record<string, ProjectAutomationRecord>;
-
-interface AutomationHostItem {
-  id: string;
-  status: ProjectAutomationStatus;
-  model: AutomationModel;
-  reasoningEffort: AutomationReasoningEffort;
-  rrule: string;
-}
-
-interface AutomationHostResponse {
-  requestId: string;
-  ok: boolean;
-  item?: AutomationHostItem;
-  items?: AutomationHostItem[];
-  quota?: AutomationQuotaStatus;
-  policy?: {
-    automationId?: string;
-    enabledByUser: boolean;
-    quotaAware: boolean;
-    intervalMinutes: AutomationIntervalMinutes;
-    model: AutomationModel;
-    reasoningEffort: AutomationReasoningEffort;
-  };
-  error?: string;
-}
-
-interface PendingAutomationRequest {
-  resolve: (response: AutomationHostResponse) => void;
-  reject: (error: Error) => void;
-  timeoutId: number;
-}
-
 const DEFAULT_USER_ACTOR: ActorIdentity = {
   type: "user",
   id: "local-user",
@@ -192,18 +184,12 @@ const DEFAULT_USER_ACTOR: ActorIdentity = {
 };
 
 const LAST_PROJECT_KEY = "taskboard.lastProjectId";
+const TOMATO_REPOSITORY_PROJECT_KEY = "taskboard.tomatoRepositoryProjectId";
 const FAVORITE_PROJECTS_KEY = "taskboard.favoriteProjectIds";
 const DEVICE_WORKSPACE_PATHS_KEY = "taskboard.deviceWorkspacePaths.v1";
+const ANALYSIS_REPOSITORY_ORDER_KEY = "taskboard.analysisRepositoryOrder.v1";
 const SHOW_EMPTY_COLUMNS_KEY = "taskboard.showEmptyColumns.v1";
 const COLUMN_VISIBILITY_KEY = "taskboard.columnVisibility.v1";
-const PROJECT_AUTOMATIONS_KEY = "taskboard.projectAutomations.v1";
-const DEFAULT_AUTOMATION_OPTIONS = {
-  enabledByUser: false,
-  quotaAware: false,
-  intervalMinutes: 5,
-  model: "gpt-5.5",
-  reasoningEffort: "high",
-} as const;
 
 const EVENT_NAMES = [
   "task.created",
@@ -242,6 +228,17 @@ function readFavoriteProjectIds(): Set<string> {
   }
 }
 
+function readAnalysisRepositoryOrder(): string[] {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(ANALYSIS_REPOSITORY_ORDER_KEY) ?? "[]");
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function readDeviceWorkspacePaths(): Record<string, string> {
   try {
     const value = JSON.parse(window.localStorage.getItem(DEVICE_WORKSPACE_PATHS_KEY) ?? "{}");
@@ -256,87 +253,6 @@ function readDeviceWorkspacePaths(): Record<string, string> {
 
 function readShowEmptyColumns(): boolean {
   return window.localStorage.getItem(SHOW_EMPTY_COLUMNS_KEY) === "true";
-}
-
-function readProjectAutomations(): ProjectAutomations {
-  try {
-    const value = JSON.parse(window.localStorage.getItem(PROJECT_AUTOMATIONS_KEY) ?? "{}");
-    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-    const result: ProjectAutomations = {};
-    for (const [projectId, record] of Object.entries(value)) {
-      if (!record || typeof record !== "object" || Array.isArray(record)) continue;
-      const candidate = record as Partial<ProjectAutomationRecord>;
-      const model = candidate.model ?? "gpt-5.5";
-      const reasoningEffort = candidate.reasoningEffort ?? "high";
-      const enabledByUser = candidate.enabledByUser ?? candidate.status === "ACTIVE";
-      const quotaAware = candidate.quotaAware ?? false;
-      if (
-        (candidate.automationId !== undefined && typeof candidate.automationId !== "string")
-        || typeof candidate.codexProjectId !== "string"
-        || (candidate.status !== "ACTIVE" && candidate.status !== "PAUSED")
-        || !isAutomationIntervalMinutes(candidate.intervalMinutes ?? 5)
-        || !isAutomationModel(model)
-        || !isAutomationReasoningEffort(reasoningEffort)
-        || !isSupportedModelEffort(model, reasoningEffort)
-        || (candidate.status === "ACTIVE" && !candidate.automationId)
-        || typeof enabledByUser !== "boolean"
-        || typeof quotaAware !== "boolean"
-      ) continue;
-      const quota = isAutomationQuotaStatus(candidate.quota) ? candidate.quota : undefined;
-      result[projectId] = {
-        automationId: candidate.automationId,
-        codexProjectId: candidate.codexProjectId,
-        status: candidate.status,
-        enabledByUser,
-        quotaAware,
-        ...(quota ? { quota } : {}),
-        intervalMinutes: candidate.intervalMinutes ?? 5,
-        model,
-        reasoningEffort,
-      };
-    }
-    return result;
-  } catch {
-    return {};
-  }
-}
-
-function isAutomationQuotaStatus(value: unknown): value is AutomationQuotaStatus {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const candidate = value as Partial<AutomationQuotaStatus>;
-  return (
-    (candidate.state === "available"
-      || candidate.state === "blocked"
-      || candidate.state === "unknown"
-      || candidate.state === "unavailable")
-    && Number.isFinite(candidate.checkedAt)
-    && (candidate.resetsAt === undefined || Number.isFinite(candidate.resetsAt))
-    && (candidate.reason === undefined || candidate.reason === "api-key")
-  );
-}
-
-function isAutomationHostPolicy(
-  value: AutomationHostResponse["policy"] | undefined,
-): value is NonNullable<AutomationHostResponse["policy"]> {
-  return Boolean(
-    value
-    && (value.automationId === undefined || typeof value.automationId === "string")
-    && typeof value.enabledByUser === "boolean"
-    && typeof value.quotaAware === "boolean"
-    && isAutomationIntervalMinutes(value.intervalMinutes)
-    && isAutomationModel(value.model)
-    && isAutomationReasoningEffort(value.reasoningEffort)
-    && isSupportedModelEffort(value.model, value.reasoningEffort),
-  );
-}
-
-function isAutomationIntervalMinutes(value: unknown): value is AutomationIntervalMinutes {
-  return value === 5 || value === 10 || value === 15 || value === 30 || value === 60;
-}
-
-function intervalMinutesFromRrule(value: string): AutomationIntervalMinutes | null {
-  const match = /^RRULE:FREQ=MINUTELY;INTERVAL=(5|10|15|30|60)$/.exec(value);
-  return match ? Number(match[1]) as AutomationIntervalMinutes : null;
 }
 
 function readColumnVisibilityByProject(): ColumnVisibilityByProject {
@@ -369,30 +285,6 @@ function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return error.message;
   if (error instanceof Error) return error.message;
   return "Something went wrong while loading your issues.";
-}
-
-function isAutomationHostItem(value: unknown): value is AutomationHostItem {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const item = value as Partial<AutomationHostItem>;
-  return (
-    typeof item.id === "string"
-    && (item.status === "ACTIVE" || item.status === "PAUSED")
-    && isAutomationModel(item.model)
-    && isAutomationReasoningEffort(item.reasoningEffort)
-    && isSupportedModelEffort(item.model, item.reasoningEffort)
-    && typeof item.rrule === "string"
-    && intervalMinutesFromRrule(item.rrule) !== null
-  );
-}
-
-function isLocalTaskboardOrigin(origin: string): boolean {
-  try {
-    const { protocol, hostname } = new URL(origin);
-    return (protocol === "http:" || protocol === "https:")
-      && (hostname === "127.0.0.1" || hostname === "localhost");
-  } catch {
-    return false;
-  }
 }
 
 function sortTasks(tasks: Task[]): Task[] {
@@ -528,7 +420,7 @@ function LocalRealtimeSync({
   return null;
 }
 
-export function App() {
+function TaskboardApp() {
   const query = useMemo(() => new URLSearchParams(window.location.search), []);
   const embedded = query.get("host") === "codex";
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
@@ -536,23 +428,44 @@ export function App() {
   const [hostContext, setHostContext] = useState<HostContext | null>(null);
   const [developmentScan, setDevelopmentScan] = useState<DevelopmentScan>({ workspacePath: null, contexts: [] });
   const [developmentScanLoading, setDevelopmentScanLoading] = useState(false);
-  const [manageTaskboardSkillPath, setManageTaskboardSkillPath] = useState("");
+  const [tomatoWorkboardSkillPath, setTomatoWorkboardSkillPath] = useState("");
   const [taskboardMetadata, setTaskboardMetadata] = useState<TaskboardMetadata | null>(null);
   const [localAiChatAvailable, setLocalAiChatAvailable] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const [codexRepositories, setCodexRepositories] = useState<CodexRepository[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState("tomato");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [tasksLoading, setTasksLoading] = useState(false);
+  const [tomatoRepositoryProjectId, setTomatoRepositoryProjectId] = useState(
+    () => window.localStorage.getItem(TOMATO_REPOSITORY_PROJECT_KEY) ?? "",
+  );
+  const [tomatoRepositoryLoading, setTomatoRepositoryLoading] = useState(false);
   const [hasLoadedTasks, setHasLoadedTasks] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [errorCopied, setErrorCopied] = useState(false);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState(readTaskFilters);
   const [showEmptyColumns, setShowEmptyColumns] = useState(readShowEmptyColumns);
   const [columnVisibilityByProject, setColumnVisibilityByProject] = useState(readColumnVisibilityByProject);
   const [boardView, setBoardView] = useState<BoardView>("issues");
+  const [tomatoSyncing, setTomatoSyncing] = useState(false);
+  const [tomatoAnalysisStarting, setTomatoAnalysisStarting] = useState(false);
+  const [tomatoAnalysisProgress, setTomatoAnalysisProgressState] = useState({
+    running: false,
+    itemKey: null as string | null,
+    threadId: null as string | null,
+    cancelRequested: false,
+    messages: [] as Array<{ content: string; at: number }>,
+    updatedAt: null as number | null,
+  });
+  const [tomatoAnalysisPanelOpen, setTomatoAnalysisPanelOpen] = useState(false);
+  const [tomatoAnalysisEvents, setTomatoAnalysisEvents] = useState<AiChatEvent[]>([]);
+  const [tomatoConversationByItemKey, setTomatoConversationByItemKey] = useState<Map<string, AiChatThread[]>>(
+    () => new Map(),
+  );
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [detailTaskIdentifier, setDetailTaskIdentifier] = useState<string | null>(
     () => readIssueIdentifier(window.location.search),
@@ -572,9 +485,8 @@ export function App() {
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [favoriteProjectIds, setFavoriteProjectIds] = useState(readFavoriteProjectIds);
   const [deviceWorkspacePaths, setDeviceWorkspacePaths] = useState(readDeviceWorkspacePaths);
-  const [projectAutomations, setProjectAutomations] = useState(readProjectAutomations);
-  const [automationPending, setAutomationPending] = useState(false);
-  const [automationError, setAutomationError] = useState<string | null>(null);
+  const [analysisRepositoryOrder, setAnalysisRepositoryOrder] = useState(readAnalysisRepositoryOrder);
+  const [analysisRepositoryDialogOpen, setAnalysisRepositoryDialogOpen] = useState(false);
   const [announcement, setAnnouncementValue] = useState("");
   const [undoNotice, setUndoNotice] = useState<UndoNotice | null>(null);
   const tasksRequestRef = useRef(0);
@@ -583,18 +495,42 @@ export function App() {
   const undoStackRef = useRef<UndoOperation[]>([]);
   const undoInFlightRef = useRef(false);
   const dragRegionRef = useRef<HTMLDivElement>(null);
+  const tomatoAiChatRef = useRef<AiChatHandle>(null);
   const selectedProjectIdRef = useRef(selectedProjectId);
   selectedProjectIdRef.current = selectedProjectId;
 
-  const revisionPollingInterval = getRevisionPollingInterval(taskboardMetadata);
-  const pendingAutomationRequestsRef = useRef(new Map<string, PendingAutomationRequest>());
-  const automationRequestInFlightRef = useRef(false);
-  const projectAutomationsRef = useRef(projectAutomations);
 
   const setAnnouncement = useCallback((message: string) => {
     setUndoNotice(null);
     setAnnouncementValue(message);
   }, []);
+
+  useEffect(() => {
+    if (!actionError) return undefined;
+    const timeout = window.setTimeout(() => setActionError(null), 8_000);
+    return () => window.clearTimeout(timeout);
+  }, [actionError]);
+
+  useEffect(() => {
+    setErrorCopied(false);
+  }, [actionError, loadError]);
+
+  useEffect(() => {
+    if (!errorCopied) return undefined;
+    const timeout = window.setTimeout(() => setErrorCopied(false), 2_000);
+    return () => window.clearTimeout(timeout);
+  }, [errorCopied]);
+
+  const copyError = useCallback(async () => {
+    const message = actionError ?? loadError;
+    if (!message) return;
+    try {
+      await navigator.clipboard.writeText(message);
+      setErrorCopied(true);
+    } catch {
+      setActionError("复制失败，请手动选择错误信息。");
+    }
+  }, [actionError, loadError]);
 
   const rememberDeviceWorkspacePath = useCallback((projectId: string, workspacePath: string) => {
     const normalizedPath = workspacePath.trim();
@@ -613,46 +549,45 @@ export function App() {
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
   const currentUser = hostContext?.user ?? DEFAULT_USER_ACTOR;
   const selectedDeviceWorkspacePath = deviceWorkspacePaths[selectedProjectId];
-  const selectedProjectAutomation = projectAutomations[selectedProjectId];
-  const automationProjectContext = useMemo(() => {
-    if (!embedded || window.parent === window) {
-      return { unavailableReason: "仅可在 Codex App 中使用" };
-    }
-    if (!isLocalTaskboardOrigin(window.location.origin)) {
-      return { unavailableReason: "仅本地任务面板可用" };
-    }
-    if (!selectedProject) return { unavailableReason: "请先选择项目" };
 
-    const directCodexProject = hostContext?.projects?.some(
-      (project) => project.id === selectedProject.id,
-    );
-    const workspacePath = deviceWorkspacePaths[selectedProject.id]
-      ?? selectedProject.workspacePath
-      ?? (
-        directCodexProject && hostContext?.projectId === selectedProject.id
-          ? hostContext.workspacePath
-          : undefined
-      );
-    const codexProjectId = directCodexProject
-      ? selectedProject.id
-      : hostContext?.projects?.find(
-        (project) => deviceWorkspacePaths[project.id] === workspacePath,
-      )?.id;
+  useEffect(() => {
+    if (selectedProjectId !== "tomato") {
+      setTomatoConversationByItemKey(new Map());
+      return;
+    }
 
-    if (!workspacePath || !codexProjectId) {
-      return { unavailableReason: "请先在 Codex 中添加并映射该项目目录" };
-    }
-    if (!manageTaskboardSkillPath) {
-      return { unavailableReason: "任务面板还没有读取到 Skill 路径" };
-    }
-    return { workspacePath, codexProjectId, unavailableReason: null };
-  }, [
-    deviceWorkspacePaths,
-    embedded,
-    hostContext,
-    manageTaskboardSkillPath,
-    selectedProject,
-  ]);
+    const controller = new AbortController();
+    let requestInFlight = false;
+    const refreshConversations = async () => {
+      if (requestInFlight || controller.signal.aborted) return;
+      requestInFlight = true;
+      try {
+        const threads = await listAiChatThreadsForProject("tomato", controller.signal);
+        const conversations = new Map<string, AiChatThread[]>();
+        for (const thread of threads) {
+          const itemKey = thread.origin.issueIdentifier;
+          if (!itemKey) continue;
+          conversations.set(itemKey, [...(conversations.get(itemKey) ?? []), thread]);
+        }
+        setTomatoConversationByItemKey((current) => (
+          sameTomatoConversationSummary(current, conversations) ? current : conversations
+        ));
+      } catch (error) {
+        if (!(error instanceof Error && error.name === "AbortError")) {
+          // Keep the last known local state through transient polling failures.
+        }
+      } finally {
+        requestInFlight = false;
+      }
+    };
+    void refreshConversations();
+    const interval = window.setInterval(() => void refreshConversations(), 2_000);
+
+    return () => {
+      window.clearInterval(interval);
+      controller.abort();
+    };
+  }, [detailTaskIdentifier, selectedProjectId]);
   const detailTask = detailTaskIdentifier
     ? tasks.find((task) => task.identifier === detailTaskIdentifier) ?? null
     : null;
@@ -696,6 +631,30 @@ export function App() {
       Number(favoriteProjectIds.has(right.id)) - Number(favoriteProjectIds.has(left.id))
     ));
   }, [favoriteProjectIds, hostContext?.projects, projects]);
+  const tomatoRepositoryOptions = useMemo(
+    () => codexRepositories.map((repository) => {
+      const hostProject = hostContext?.projects?.find((project) => project.id === repository.projectId);
+      return {
+        ...repository,
+        id: repository.projectId,
+        name: hostProject?.name ?? repository.name,
+      };
+    }),
+    [codexRepositories, hostContext?.projects],
+  );
+  const orderedCodexRepositories = useMemo(() => {
+    const rank = new Map(analysisRepositoryOrder.map((projectId, index) => [projectId, index]));
+    return [...tomatoRepositoryOptions].sort((left, right) => (
+      (rank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.id) ?? Number.MAX_SAFE_INTEGER)
+    ));
+  }, [analysisRepositoryOrder, tomatoRepositoryOptions]);
+  const orderedAnalysisRepositories = useMemo(() => {
+    const rank = new Map(orderedCodexRepositories.map((repository, index) => [repository.workspacePath, index]));
+    const configured = taskboardMetadata?.analysisRepositories ?? [];
+    return [...configured].sort((left, right) => (
+      (rank.get(left) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right) ?? Number.MAX_SAFE_INTEGER)
+    ));
+  }, [orderedCodexRepositories, taskboardMetadata?.analysisRepositories]);
   const projectsWithIssues = useMemo(
     () => projectChoices.filter((project) => project.issueCount > 0),
     [projectChoices],
@@ -706,224 +665,18 @@ export function App() {
   );
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
 
-  const writeProjectAutomation = useCallback((
-    projectId: string,
-    record: ProjectAutomationRecord | null | undefined,
-  ) => {
-    setProjectAutomations((current) => {
-      if (
-        record
-        && current[projectId]?.automationId === record.automationId
-        && current[projectId]?.codexProjectId === record.codexProjectId
-        && current[projectId]?.status === record.status
-        && current[projectId]?.enabledByUser === record.enabledByUser
-        && current[projectId]?.quotaAware === record.quotaAware
-        && JSON.stringify(current[projectId]?.quota) === JSON.stringify(record.quota)
-        && current[projectId]?.intervalMinutes === record.intervalMinutes
-        && current[projectId]?.model === record.model
-        && current[projectId]?.reasoningEffort === record.reasoningEffort
-      ) {
-        return current;
-      }
-      const next = { ...current };
-      if (record) next[projectId] = record;
-      else delete next[projectId];
-      projectAutomationsRef.current = next;
-      window.localStorage.setItem(PROJECT_AUTOMATIONS_KEY, JSON.stringify(next));
-      return next;
-    });
-  }, []);
-
-  const sendAutomationRequest = useCallback((
-    operation: "ensure-active" | "pause" | "list" | "apply-policy",
-    options: Pick<
-      ProjectAutomationRecord,
-      "enabledByUser" | "quotaAware" | "intervalMinutes" | "model" | "reasoningEffort"
-    >,
-    automationId?: string,
-  ) => {
-    if (
-      !selectedProject
-      || !automationProjectContext.codexProjectId
-      || !automationProjectContext.workspacePath
-    ) {
-      return Promise.reject(new Error(
-        automationProjectContext.unavailableReason ?? "无法读取项目自动化信息",
-      ));
-    }
-    const requestId = window.crypto.randomUUID();
-    const response = new Promise<AutomationHostResponse>((resolve, reject) => {
-      const timeoutId = window.setTimeout(() => {
-        pendingAutomationRequestsRef.current.delete(requestId);
-        reject(new Error("Codex 自动化没有响应，请稍后重试"));
-      }, 10_000);
-      pendingAutomationRequestsRef.current.set(requestId, { resolve, reject, timeoutId });
-    });
-    window.parent.postMessage({
-      type: "taskboard:automation-request",
-      payload: {
-        requestId,
-        operation,
-        taskboardProjectId: selectedProjectId,
-        codexProjectId: automationProjectContext.codexProjectId,
-        projectName: selectedProject.name,
-        workspacePath: automationProjectContext.workspacePath,
-        skillPath: manageTaskboardSkillPath,
-        ...(automationId ? { automationId } : {}),
-        enabledByUser: options.enabledByUser,
-        quotaAware: options.quotaAware,
-        intervalMinutes: options.intervalMinutes,
-        model: options.model,
-        reasoningEffort: options.reasoningEffort,
-      },
-    }, "*");
-    return response;
-  }, [
-    automationProjectContext,
-    manageTaskboardSkillPath,
-    selectedProject,
-    selectedProjectId,
-  ]);
-
-  const reconcileProjectAutomation = useCallback(async () => {
-    if (automationProjectContext.unavailableReason) {
-      setAutomationError(null);
-      return;
-    }
-    if (!selectedProjectId || !automationProjectContext.codexProjectId || automationRequestInFlightRef.current) return;
-    const stored = projectAutomationsRef.current[selectedProjectId];
-    automationRequestInFlightRef.current = true;
-    setAutomationPending(true);
-    setAutomationError(null);
-    try {
-      const options = stored ?? {
-        status: "PAUSED" as const,
-        ...DEFAULT_AUTOMATION_OPTIONS,
-      };
-      const response = await sendAutomationRequest(
-        stored ? "apply-policy" : "list",
-        options,
-        stored?.automationId,
-      );
-      const items = Array.isArray(response.items)
-        ? response.items.filter(isAutomationHostItem)
-        : [];
-      if (!stored) {
-        const policy = isAutomationHostPolicy(response.policy) ? response.policy : null;
-        if (!policy) return;
-        const item = items.find((candidate) => candidate.id === policy.automationId)
-          ?? (items.length === 1 ? items[0] : undefined);
-        writeProjectAutomation(selectedProjectId, {
-          automationId: item?.id ?? policy.automationId,
-          codexProjectId: automationProjectContext.codexProjectId,
-          status: item?.status ?? "PAUSED",
-          enabledByUser: policy.enabledByUser,
-          quotaAware: policy.quotaAware,
-          intervalMinutes: policy.intervalMinutes,
-          model: policy.model,
-          reasoningEffort: policy.reasoningEffort,
-        });
-        return;
-      }
-      const item = (isAutomationHostItem(response.item) ? response.item : undefined)
-        ?? items.find((item) => item.id === stored?.automationId)
-        ?? (items.length === 1 ? items[0] : undefined);
-      if (!item) {
-        if (stored) {
-          writeProjectAutomation(selectedProjectId, {
-            ...stored,
-            automationId: undefined,
-            status: "PAUSED",
-            ...(response.quota ? { quota: response.quota } : {}),
-          });
-        }
-        return;
-      }
-      const intervalMinutes = intervalMinutesFromRrule(item.rrule);
-      if (!intervalMinutes) return;
-      writeProjectAutomation(selectedProjectId, {
-        automationId: item.id,
-        codexProjectId: automationProjectContext.codexProjectId,
-        status: item.status,
-        enabledByUser: stored.enabledByUser,
-        quotaAware: stored.quotaAware,
-        ...(response.quota ? { quota: response.quota } : {}),
-        intervalMinutes,
-        model: item.model,
-        reasoningEffort: item.reasoningEffort,
-      });
-    } catch (error) {
-      setAutomationError(error instanceof Error ? error.message : "无法读取自动化状态");
-    } finally {
-      automationRequestInFlightRef.current = false;
-      setAutomationPending(false);
-    }
-  }, [
-    automationProjectContext,
-    selectedProjectId,
-    sendAutomationRequest,
-    writeProjectAutomation,
-  ]);
-
-  const saveProjectAutomation = useCallback(async (options: {
-    enabledByUser: boolean;
-    quotaAware: boolean;
-    intervalMinutes: AutomationIntervalMinutes;
-    model: AutomationModel;
-    reasoningEffort: AutomationReasoningEffort;
-  }) => {
-    const stored = projectAutomations[selectedProjectId];
-    if (
-      !selectedProjectId
-      || automationProjectContext.unavailableReason
-      || !automationProjectContext.codexProjectId
-      || automationRequestInFlightRef.current
-    ) return;
-    const previousRecord = stored;
-    automationRequestInFlightRef.current = true;
-    setAutomationPending(true);
-    setAutomationError(null);
-    try {
-      const response = await sendAutomationRequest("apply-policy", options, stored?.automationId);
-      const item = isAutomationHostItem(response.item) ? response.item : undefined;
-      writeProjectAutomation(selectedProjectId, {
-        automationId: item?.id,
-        codexProjectId: automationProjectContext.codexProjectId,
-        status: item?.status ?? "PAUSED",
-        enabledByUser: options.enabledByUser,
-        quotaAware: options.quotaAware,
-        ...(response.quota ? { quota: response.quota } : {}),
-        intervalMinutes: options.intervalMinutes,
-        model: options.model,
-        reasoningEffort: options.reasoningEffort,
-      });
-    } catch (error) {
-      writeProjectAutomation(selectedProjectId, previousRecord);
-      setAutomationError(error instanceof Error ? error.message : "无法更新自动化");
-    } finally {
-      automationRequestInFlightRef.current = false;
-      setAutomationPending(false);
-    }
-  }, [
-    automationProjectContext,
-    projectAutomations,
-    selectedProjectId,
-    sendAutomationRequest,
-    writeProjectAutomation,
-  ]);
-
   function openTaskDetail(task: Pick<Task, "identifier" | "projectId">) {
     closeContextMenu();
     setProjectMenuOpen(false);
     setDetailTaskIdentifier(task.identifier);
     const currentIssue = readIssueIdentifier(window.location.search);
-    const boardUrl = buildIssueUrl(window.location.href, task.projectId, null);
+    const boardUrl = buildIssueUrl(window.location.href, null, null);
     if (!currentIssue) {
       window.history.replaceState(window.history.state, "", boardUrl);
     }
     const detailUrl = buildIssueUrl(
       currentIssue ? window.location.href : boardUrl.href,
-      task.projectId,
+      null,
       task.identifier,
     );
     window.history.pushState(window.history.state, "", detailUrl);
@@ -931,25 +684,22 @@ export function App() {
 
   function closeTaskDetail() {
     setDetailTaskIdentifier(null);
-    const url = buildIssueUrl(window.location.href, selectedProjectId || null, null);
+    const url = buildIssueUrl(window.location.href, null, null);
     window.history.replaceState(window.history.state, "", url);
   }
 
   useEffect(() => {
+    const initialUrl = buildIssueUrl(window.location.href, null, readIssueIdentifier(window.location.search));
+    window.history.replaceState(window.history.state, "", initialUrl);
+
     function syncRouteFromLocation() {
       const url = new URL(window.location.href);
-      const routeProjectId = url.searchParams.get("project") ?? "";
       setDetailTaskIdentifier(readIssueIdentifier(url.search));
-      if (routeProjectId === selectedProjectId) return;
-      setBoardView("issues");
-      setSelectedProjectId(routeProjectId);
-      if (routeProjectId) window.localStorage.setItem(LAST_PROJECT_KEY, routeProjectId);
-      else window.localStorage.removeItem(LAST_PROJECT_KEY);
     }
 
     window.addEventListener("popstate", syncRouteFromLocation);
     return () => window.removeEventListener("popstate", syncRouteFromLocation);
-  }, [selectedProjectId]);
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -984,9 +734,13 @@ export function App() {
   }, [projectMenuOpen]);
 
   useEffect(() => {
-    setAutomationError(null);
-    void reconcileProjectAutomation();
-  }, [selectedProjectId, reconcileProjectAutomation]);
+    if (!analysisRepositoryDialogOpen) return undefined;
+    function closeFromEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setAnalysisRepositoryDialogOpen(false);
+    }
+    window.addEventListener("keydown", closeFromEscape);
+    return () => window.removeEventListener("keydown", closeFromEscape);
+  }, [analysisRepositoryDialogOpen]);
 
   useEffect(() => {
     if (!embedded || window.parent === window) return;
@@ -994,20 +748,6 @@ export function App() {
     function receiveHostMessage(event: MessageEvent) {
       if (event.source !== window.parent || !event.data || typeof event.data !== "object") return;
       const message = event.data as { type?: string; payload?: unknown; theme?: unknown };
-
-      if (message.type === "taskboard:automation-response" && message.payload) {
-        const payload = message.payload as Partial<AutomationHostResponse>;
-        if (typeof payload.requestId !== "string") return;
-        const pending = pendingAutomationRequestsRef.current.get(payload.requestId);
-        if (!pending) return;
-        window.clearTimeout(pending.timeoutId);
-        pendingAutomationRequestsRef.current.delete(payload.requestId);
-        if (payload.ok) pending.resolve(payload as AutomationHostResponse);
-        else pending.reject(new Error(
-          typeof payload.error === "string" ? payload.error : "Codex 无法更新自动化",
-        ));
-        return;
-      }
 
       if (message.type === "taskboard:theme" && isTheme(message.theme)) {
         setTheme(message.theme);
@@ -1037,10 +777,6 @@ export function App() {
     window.parent.postMessage({ type: "taskboard:ready" }, "*");
     return () => {
       window.removeEventListener("message", receiveHostMessage);
-      for (const pending of pendingAutomationRequestsRef.current.values()) {
-        window.clearTimeout(pending.timeoutId);
-      }
-      pendingAutomationRequestsRef.current.clear();
     };
   }, [embedded]);
 
@@ -1069,22 +805,23 @@ export function App() {
     setProjectsLoading(true);
     setLoadError(null);
     try {
-      const [nextProjects, metadata, workspaces] = await Promise.all([
+      const [nextProjects, metadata, workspaces, nextCodexRepositories] = await Promise.all([
         listProjects(signal),
         getTaskboardMetadata(signal),
         listDeviceWorkspaces(signal),
+        listCodexRepositories(signal),
       ]);
       setTaskboardMetadata((current) => (
         current
         && current.mode === metadata.mode
         && current.realtime?.transport === metadata.realtime?.transport
         && current.realtime?.intervalMs === metadata.realtime?.intervalMs
-        && current.manageTaskboardSkillPath === metadata.manageTaskboardSkillPath
-        && current.localCapabilities?.available === metadata.localCapabilities?.available
+        && current.tomatoWorkboardSkillPath === metadata.tomatoWorkboardSkillPath
+        && JSON.stringify(current.analysisRepositories ?? []) === JSON.stringify(metadata.analysisRepositories ?? [])
           ? current
           : metadata
       ));
-      setManageTaskboardSkillPath(metadata.manageTaskboardSkillPath ?? "");
+      setTomatoWorkboardSkillPath(metadata.tomatoWorkboardSkillPath ?? "");
       setLocalAiChatAvailable(metadata.capabilities?.localAiChat === true);
       setDeviceWorkspacePaths((current) => {
         const next = { ...current, ...workspaces };
@@ -1093,6 +830,7 @@ export function App() {
         return next;
       });
       setProjects(nextProjects);
+      setCodexRepositories(nextCodexRepositories);
       setSelectedProjectId((current) => {
         const fromQuery = new URLSearchParams(window.location.search).get("project");
         const remembered = window.localStorage.getItem(LAST_PROJECT_KEY);
@@ -1142,6 +880,133 @@ export function App() {
       if (!options.quiet && requestId === tasksRequestRef.current) setTasksLoading(false);
     }
   }, []);
+
+  const refreshTomato = useCallback(async () => {
+    if (tomatoSyncing) return;
+    setTomatoSyncing(true);
+    setActionError(null);
+    try {
+      const result = await syncTomatoItems();
+      await Promise.all([
+        refreshTasks("tomato", { quiet: true }),
+        refreshProjectList(),
+      ]);
+      setAnnouncement(`已从番茄刷新 ${result.total} 张卡片`);
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setTomatoSyncing(false);
+    }
+  }, [refreshProjectList, refreshTasks, setAnnouncement, tomatoSyncing]);
+
+  const startTomatoAnalysis = useCallback(async () => {
+    if (tomatoAnalysisStarting || tomatoSyncing) return;
+    const analysisProject = projects.find((project) => project.id === "local")
+      ?? projects.find((project) => project.id !== "tomato");
+    if (!analysisProject) {
+      setActionError("没有可用于启动分析的本地 Codex 项目。");
+      return;
+    }
+    const configuredRepositories = orderedAnalysisRepositories;
+    const repositoryInstruction = configuredRepositories.length > 0
+      ? [
+          "按下面的顺序排查已配置的代码仓库；只有前一个仓库证据不足时才检查下一个，禁止猜测或替换成本机其他绝对路径：",
+          ...configuredRepositories.map((repository, index) => `${index + 1}. ${repository}`),
+        ].join("\n")
+      : "当前没有配置代码仓库候选列表；只使用事项绑定仓库或当前 Codex workspace，禁止猜测本机绝对路径。";
+    setTomatoAnalysisStarting(true);
+    setTomatoAnalysisEvents([]);
+    setActionError(null);
+    try {
+      const startingProgress = await setTomatoAnalysisProgress(true, null, null);
+      setTomatoAnalysisProgressState(startingProgress);
+      const thread = await createAiChatThread({
+        projectId: analysisProject.id,
+        title: "番茄 Bug 手动分析",
+        reasoningEffort: "high",
+        sandbox: "danger-full-access",
+      });
+      const runningProgress = await setTomatoAnalysisProgress(
+        true,
+        null,
+        thread.id,
+        "正在读取本地候选列表（不刷新番茄）",
+      );
+      setTomatoAnalysisProgressState(runningProgress);
+      setTomatoAnalysisPanelOpen(true);
+      await startAiChatTurn(thread.id, {
+        message: [
+          "立即执行一次番茄 Bug 分析，不要读取自动化配置、项目 skill 或扫描工作台源码。",
+          "第一步直接 GET http://127.0.0.1:47823/api/local/tomato/analysis-candidates；禁止调用同步接口或 tomato.searchItems，只处理该接口返回且 tomatoAnalysis 为空的候选。任何已有绿、橙、红分析结果的卡片都必须跳过。",
+          `逐张处理：先上报 analysis-progress（running=true、当前 itemKey、精简 message），再使用当前会话已配置的番茄读取能力获取该事项详情和评论并计算证据指纹；核心同步已经通过本地番茄 CLI 完成。\n${repositoryInstruction}\n仍无依据不得判绿。`,
+          "有明确根因和可执行方案为 fixable，否则按是否需要明确人工动作分别写 needs_human 或 insufficient。调用 /api/local/tomato/items/{itemKey}/analysis 保存结果。新判绿时通过 transitions 接口流转到修复中并回读确认。",
+          "每个主要步骤及进入下一张前读取 analysis-progress；cancelRequested=true 时立即停止。单张失败记录后继续下一张。整轮结束 POST running=false、itemKey=null，并用 message 汇总数量。",
+          "过程 message 只写当前卡片、取证仓库、定位结果、颜色结论，不输出命令、思考或原始日志。直接使用现有 127.0.0.1:47823 服务，禁止启动、停止或重启服务。",
+        ].join("\n"),
+        dangerFullAccessConfirmed: true,
+      });
+      setAnnouncement("已基于当前工作台卡片启动手动分析。");
+    } catch (error) {
+      void setTomatoAnalysisProgress(false, null).then(setTomatoAnalysisProgressState).catch(() => undefined);
+      setActionError(errorMessage(error));
+    } finally {
+      setTomatoAnalysisStarting(false);
+    }
+  }, [orderedAnalysisRepositories, projects, setAnnouncement, tomatoAnalysisStarting, tomatoSyncing]);
+
+  const stopTomatoAnalysis = useCallback(async () => {
+    if (!tomatoAnalysisProgress.running) return;
+    setActionError(null);
+    try {
+      if (tomatoAnalysisProgress.threadId) {
+        const snapshot = await getAiChatThread(tomatoAnalysisProgress.threadId);
+        if (snapshot.thread.currentRun?.id) await interruptAiChatRun(snapshot.thread.currentRun.id);
+      }
+      const stopped = await setTomatoAnalysisProgress(
+        false,
+        tomatoAnalysisProgress.itemKey,
+        undefined,
+        "用户已中断本轮分析",
+        true,
+      );
+      setTomatoAnalysisProgressState(stopped);
+      setAnnouncement("已中断番茄 Bug 分析，已完成的结果会保留。");
+    } catch (error) {
+      setActionError(errorMessage(error));
+    }
+  }, [setAnnouncement, tomatoAnalysisProgress]);
+
+  useEffect(() => {
+    if (selectedProjectId !== "tomato") return undefined;
+    const controller = new AbortController();
+    const refreshProgress = () => void getTomatoAnalysisProgress(controller.signal)
+      .then(setTomatoAnalysisProgressState)
+      .catch((error) => {
+        if ((error as Error).name !== "AbortError") console.warn("Unable to refresh Tomato analysis progress", error);
+      });
+    refreshProgress();
+    const interval = window.setInterval(refreshProgress, 1_500);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!tomatoAnalysisProgress.threadId) return undefined;
+    const controller = new AbortController();
+    const refreshEvents = () => void getAiChatThread(tomatoAnalysisProgress.threadId!, controller.signal)
+      .then((snapshot) => setTomatoAnalysisEvents(snapshot.events))
+      .catch((error) => {
+        if ((error as Error).name !== "AbortError") console.warn("Unable to refresh Tomato analysis conversation", error);
+      });
+    refreshEvents();
+    const interval = window.setInterval(refreshEvents, 1_500);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [tomatoAnalysisProgress.threadId]);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -1212,46 +1077,6 @@ export function App() {
     rememberDeviceWorkspacePath,
     selectedProjectId,
     selectedDeviceWorkspacePath,
-  ]);
-
-  useEffect(() => {
-    if (revisionPollingInterval === null) return;
-    const controller = new AbortController();
-    setConnection("connecting");
-    const poller = createRevisionPoller({
-      intervalMs: revisionPollingInterval,
-      fetchRevision: async (since: number) => {
-        try {
-          const result = await getTaskboardRevision(since, controller.signal);
-          setConnection("live");
-          return result;
-        } catch (error) {
-          if (!controller.signal.aborted) setConnection("reconnecting");
-          throw error;
-        }
-      },
-      onInvalidate: () => {
-        void refreshProjectList();
-        const projectId = selectedProjectIdRef.current;
-        if (projectId) {
-          void refreshTasks(projectId, { quiet: true });
-          void refreshWorkflowOptions(projectId).catch(() => {});
-        }
-        setWorkflowRevision((current) => current + 1);
-        setCommentsRevision((current) => current + 1);
-        setAttachmentsRevision((current) => current + 1);
-      },
-    });
-    poller.start();
-    return () => {
-      controller.abort();
-      poller.stop();
-    };
-  }, [
-    revisionPollingInterval,
-    refreshProjectList,
-    refreshTasks,
-    refreshWorkflowOptions,
   ]);
 
   function pushUndo(message: string, undo: () => Promise<void>, showNotice = true) {
@@ -1334,11 +1159,55 @@ export function App() {
     return () => window.removeEventListener("keydown", handleShortcut);
   }, [boardView, contextMenu, detailTaskId, editor, projectMenuOpen, selectedProjectId]);
 
+  const isTomatoBoard = selectedProjectId === "tomato";
   const filteredTasks = useMemo(() => {
-    return tasks.filter(
-      (task) => matchesTaskSearch(task, search) && matchesTaskFilters(task, filters),
-    );
-  }, [filters, search, tasks]);
+    const normalizedSearch = search.trim().toLowerCase();
+    return tasks.filter((task) => {
+      const matchesSearch = isTomatoBoard
+        ? !normalizedSearch || [task.title, task.creatorName, ...task.labels]
+          .join(" ")
+          .toLowerCase()
+          .includes(normalizedSearch)
+        : matchesTaskSearch(task, search);
+      return matchesSearch && matchesTaskFilters(task, filters);
+    });
+  }, [filters, isTomatoBoard, search, tasks]);
+
+  const tomatoTasksByStatus = useMemo(() => {
+    const groups = new Map<string, Task[]>();
+    for (const task of filteredTasks) {
+      const status = task.description.match(/(?:^|\n)当前状态：([^\n]+)/)?.[1]?.trim() || "未设置状态";
+      if (!isVisibleTomatoStatus(status)) continue;
+      groups.set(status, [...(groups.get(status) ?? []), task]);
+    }
+    return groups;
+  }, [filteredTasks]);
+
+  const tomatoVisibleStatuses = useMemo(() => {
+    const known = TOMATO_STATUS_ORDER.filter((status) => tomatoTasksByStatus.has(status));
+    const extra = [...tomatoTasksByStatus.keys()].filter((status) => !TOMATO_STATUS_ORDER.includes(status));
+    return [...known, ...extra];
+  }, [tomatoTasksByStatus]);
+
+  useEffect(() => {
+    if (!detailTask || detailTask.projectId !== "tomato") return;
+    const itemKey = tomatoItemKeyFromTask(detailTask);
+    const conversationProjectId = itemKey
+      ? tomatoConversationByItemKey.get(itemKey)?.[0]?.origin.projectId
+      : null;
+    const recoveredProjectId = detailTask.repositoryProjectId
+      || conversationProjectId
+      || tomatoRepositoryProjectId
+      || "";
+    setTomatoRepositoryProjectId(recoveredProjectId);
+    if (!detailTask.repositoryProjectId && conversationProjectId) {
+      void updateTaskRequest(detailTask, { repositoryProjectId: conversationProjectId })
+        .then((saved) => {
+          setTasks((current) => current.map((task) => task.id === saved.id ? saved : task));
+        })
+        .catch((error) => setActionError(errorMessage(error)));
+    }
+  }, [detailTask, tomatoConversationByItemKey, tomatoRepositoryProjectId]);
 
   const activeFilterCount = taskFilterCount(filters);
 
@@ -1666,20 +1535,142 @@ export function App() {
 
   async function copyText(text: string, message: string) {
     try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
       await navigator.clipboard.writeText(text);
       setAnnouncement(message);
-    } catch {
+      return;
+    } catch {}
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand("copy");
+    textarea.remove();
+    if (copied) {
+      setAnnouncement(message);
+    } else {
       setActionError("无法写入剪贴板。");
     }
   }
 
   function openThread(threadId: string) {
     if (embedded && window.parent !== window) {
-      window.parent.postMessage({ type: "taskboard:open-thread", payload: { threadId } }, "*");
+      window.parent.postMessage({
+        type: "taskboard:open-thread",
+        payload: { threadId },
+      }, "*");
       return;
     }
 
-    window.location.assign(`codex://threads/${encodeURIComponent(threadId.trim())}`);
+    const normalizedThreadId = threadId.trim();
+    void openCodexThreadRequest(normalizedThreadId)
+      .then(() => setAnnouncement("已在 Codex 中打开对应对话。"))
+      .catch((error) => {
+        setActionError(error instanceof Error ? error.message : "无法打开 Codex 对话");
+      });
+  }
+
+  async function oneClickFixTomatoTask(task: Task) {
+    const itemKey = tomatoItemKeyFromTask(task);
+    if (!itemKey || task.tomatoAnalysis?.status !== "fixable") return;
+    const analysis = task.tomatoAnalysis;
+    const storedRepositories = task.tomatoRepositories ?? [];
+    const repositoryConfigs = storedRepositories.length > 0
+      ? storedRepositories
+      : task.repositoryProjectId
+        ? [{ projectId: task.repositoryProjectId, developmentBranch: "", rebaseBranch: "" }]
+        : [];
+    if (repositoryConfigs.length === 0) {
+      openTaskDetail(task);
+      setAnnouncement("请先为这张绿色卡片添加修复仓库，再点击一键修复。");
+      return;
+    }
+    if (repositoryConfigs.some((config) => !config.rebaseBranch)) {
+      openTaskDetail(task);
+      setAnnouncement("请为每个修复仓库选择 rebase 分支，再点击一键修复。");
+      return;
+    }
+    setActionError(null);
+    try {
+      const repairThreads = await Promise.all(repositoryConfigs.map(async (config) => {
+        const thread = await createAiChatThread({
+          projectId: config.projectId,
+          issueId: task.id,
+          issueProjectId: "tomato",
+          title: `${itemKey} 一键修复`,
+          sandbox: "workspace-write",
+        });
+        const run = await startAiChatTurn(thread.id, {
+          message: [
+            `请修复番茄 Bug ${itemKey}。`,
+            `已确认的问题：${analysis.summary}`,
+            `修复方案：${analysis.repairPlan}`,
+            analysis.decision ? `已确认决策：${analysis.decision}` : "",
+            `修复基线分支（Rebase）：${config.rebaseBranch}`,
+            `先读取番茄事项的最新详情并确认状态仍为新建或修复中；然后更新仓库引用，切换到 ${config.rebaseBranch} 并确保本地处于该分支的最新提交，直接在这个分支上完成最小修复，不要创建或切换到其他工作分支。不要修改番茄状态。完成后说明基线分支、更新结果、改动文件和验证结果。`,
+          ].filter(Boolean).join("\n\n"),
+        });
+        return { ...thread, status: "running" as const, currentRun: run };
+      }));
+      tomatoAiChatRef.current?.showThread(repairThreads[0]);
+      const threads = await listAiChatThreadsForProject("tomato");
+      setTomatoConversationByItemKey(groupTomatoConversations(threads));
+      setAnnouncement(`${itemKey} 已在 ${repositoryConfigs.length} 个仓库启动修复任务。`);
+    } catch (error) {
+      setActionError(errorMessage(error));
+    }
+  }
+
+  async function submitTomatoFix(task: Task) {
+    const itemKey = tomatoItemKeyFromTask(task);
+    if (!itemKey || task.tomatoAnalysis?.status !== "fixable") return;
+    const repositoryConfigs = (task.tomatoRepositories ?? []).length > 0
+      ? task.tomatoRepositories ?? []
+      : task.repositoryProjectId
+        ? [{ projectId: task.repositoryProjectId, developmentBranch: "", rebaseBranch: "" }]
+        : [];
+    if (repositoryConfigs.length === 0) {
+      openTaskDetail(task);
+      setAnnouncement("请先为这张绿色卡片添加提交仓库，再点击提交。");
+      return;
+    }
+    if (repositoryConfigs.some((config) => !config.rebaseBranch)) {
+      openTaskDetail(task);
+      setAnnouncement("请为每个提交仓库选择 rebase 分支，再点击提交。");
+      return;
+    }
+    setActionError(null);
+    try {
+      const submitThreads = await Promise.all(repositoryConfigs.map(async (config) => {
+        const thread = await createAiChatThread({
+          projectId: config.projectId,
+          issueId: task.id,
+          issueProjectId: "tomato",
+          title: `${itemKey} 提交修复`,
+          sandbox: "danger-full-access",
+        });
+        const run = await startAiChatTurn(thread.id, {
+          dangerFullAccessConfirmed: true,
+          message: [
+            `请提交并推送番茄 Bug ${itemKey} 的当前修复。`,
+            `目标分支名：${itemKey}`,
+            `基线分支：${config.rebaseBranch}`,
+            `在当前仓库识别属于 ${itemKey} 的修复改动。更新远端引用，以 ${config.rebaseBranch} 的最新提交为基线创建分支 ${itemKey}。尽量不要切换当前工作区的分支，优先使用临时 git worktree，把本卡片的修复改动带入新分支；在新分支提交，commit message 包含 [${itemKey}]，然后 push -u origin ${itemKey}。完成后清理临时 worktree，但保留分支和提交。最后报告提交哈希、远端分支和推送结果。`,
+          ].join("\n\n"),
+        });
+        return { ...thread, status: "running" as const, currentRun: run };
+      }));
+      tomatoAiChatRef.current?.showThread(submitThreads[0]);
+      const threads = await listAiChatThreadsForProject("tomato");
+      setTomatoConversationByItemKey(groupTomatoConversations(threads));
+      setAnnouncement(`${itemKey} 已在 ${repositoryConfigs.length} 个仓库启动提交和推送。`);
+    } catch (error) {
+      setActionError(errorMessage(error));
+    }
   }
 
   function expandCodexSidebar() {
@@ -1688,8 +1679,8 @@ export function App() {
   }
 
   function openTaskInThread(task: Task) {
-    if (!manageTaskboardSkillPath) {
-      setActionError("任务面板还没有读取到 manage-taskboard Skill 路径，请刷新后重试。");
+    if (!tomatoWorkboardSkillPath) {
+      setActionError("任务面板还没有读取到 tomato-workboard Skill 路径，请刷新后重试。");
       return;
     }
     const worktreePath = task.developmentContext?.type === "worktree"
@@ -1699,8 +1690,8 @@ export function App() {
       ?? selectedDeviceWorkspacePath
       ?? developmentScan.workspacePath
       ?? hostContext?.workspacePath;
-    const instruction = `e-taskboard Addressing the issues mentioned in ${task.identifier}`;
-    const prompt = `[$manage-taskboard](${manageTaskboardSkillPath}) ${instruction}`;
+    const instruction = `Work on the Tomato issue ${task.identifier}: ${task.title}`;
+    const prompt = `[$tomato-workboard](${tomatoWorkboardSkillPath}) ${instruction}`;
 
     if (!embedded || window.parent === window) {
       const query = new URLSearchParams();
@@ -1719,9 +1710,9 @@ export function App() {
         taskId: task.id,
         identifier: task.identifier,
         instruction,
-        skillName: "manage-taskboard",
-        skillDisplayName: "Manage Taskboard",
-        skillPath: manageTaskboardSkillPath,
+        skillName: "tomato-workboard",
+        skillDisplayName: "Tomato Workboard",
+        skillPath: tomatoWorkboardSkillPath,
         codexProjectId: codexProject?.id ?? (selectedProject?.id === "local" ? hostContext?.projectId : selectedProject?.id),
         projectName: selectedProject?.name,
         workspacePath,
@@ -1775,6 +1766,17 @@ export function App() {
     setAnnouncement(`${selectedProject?.name ?? "项目"}${shouldFavorite ? "已收藏。" : "已取消收藏。"}`);
   }
 
+  function moveAnalysisRepository(projectId: string, direction: -1 | 1) {
+    const current = orderedCodexRepositories.map((repository) => repository.projectId);
+    const index = current.indexOf(projectId);
+    const nextIndex = index + direction;
+    if (index < 0 || nextIndex < 0 || nextIndex >= current.length) return;
+    [current[index], current[nextIndex]] = [current[nextIndex], current[index]];
+    setAnalysisRepositoryOrder(current);
+    window.localStorage.setItem(ANALYSIS_REPOSITORY_ORDER_KEY, JSON.stringify(current));
+    setAnnouncement("已更新分析仓库顺序，下一轮分析会按新顺序逐个排查。");
+  }
+
   async function selectProject(choice: ProjectChoice) {
     if (openingProjectId) return;
     setOpeningProjectId(choice.id);
@@ -1805,6 +1807,123 @@ export function App() {
     }
   }
 
+  async function selectTomatoRepository(projectId: string) {
+    if (tomatoRepositoryLoading) return;
+    const choice = tomatoRepositoryOptions.find((project) => project.id === projectId);
+    if (!choice) return;
+    setTomatoRepositoryLoading(true);
+    setActionError(null);
+    try {
+      if (!projects.some((project) => project.id === choice.id)) {
+        try {
+          const project = await createProjectRequest({
+            id: choice.id,
+            name: choice.name,
+            workspacePath: null,
+          });
+          setProjects((current) => current.some((item) => item.id === project.id)
+            ? current
+            : [...current, project]);
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.code !== "PROJECT_EXISTS") throw error;
+          setProjects(await listProjects());
+        }
+      }
+      setTomatoRepositoryProjectId(choice.id);
+      window.localStorage.setItem(TOMATO_REPOSITORY_PROJECT_KEY, choice.id);
+      if (detailTask?.projectId === "tomato") {
+        const storedRepositories = detailTask.tomatoRepositories ?? [];
+        const tomatoRepositories = storedRepositories.some((config) => config.projectId === choice.id)
+          ? storedRepositories
+          : [
+              ...storedRepositories,
+              { projectId: choice.id, developmentBranch: "", rebaseBranch: "" },
+            ];
+        const saved = await updateTaskRequest(detailTask, {
+          repositoryProjectId: choice.id,
+          tomatoRepositories,
+        });
+        setTasks((current) => current.map((task) => task.id === saved.id ? saved : task));
+      }
+      setAnnouncement(`番茄对话仓库已选择：${choice.name}`);
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setTomatoRepositoryLoading(false);
+    }
+  }
+
+  async function updateTomatoRepositoryConfigs(configs: Task["tomatoRepositories"]) {
+    if (!detailTask || detailTask.projectId !== "tomato") return;
+    try {
+      const saved = await updateTaskRequest(detailTask, {
+        tomatoRepositories: configs,
+        repositoryProjectId: configs[0]?.projectId ?? null,
+      });
+      setTasks((current) => current.map((task) => task.id === saved.id ? saved : task));
+      const nextRepositoryProjectId = configs[0]?.projectId ?? "";
+      setTomatoRepositoryProjectId(nextRepositoryProjectId);
+      if (nextRepositoryProjectId) {
+        window.localStorage.setItem(TOMATO_REPOSITORY_PROJECT_KEY, nextRepositoryProjectId);
+      } else {
+        window.localStorage.removeItem(TOMATO_REPOSITORY_PROJECT_KEY);
+      }
+      setAnnouncement("修复仓库与分支已保存");
+    } catch (error) {
+      setActionError(errorMessage(error));
+    }
+  }
+
+  async function toggleTomatoAnalysis(task: Task) {
+    try {
+      const itemKey = tomatoItemKeyFromTask(task);
+      if (!itemKey) return;
+      const saved = await setTomatoAnalysisDisabled(itemKey, !task.tomatoAnalysisDisabled);
+      setTasks((current) => current.map((item) => item.id === saved.id ? saved : item));
+      setAnnouncement(saved.tomatoAnalysisDisabled
+        ? `${tomatoItemKeyFromTask(saved)} 已暂停自动分析`
+        : `${tomatoItemKeyFromTask(saved)} 已恢复自动分析`);
+    } catch (error) {
+      setActionError(errorMessage(error));
+    }
+  }
+
+
+  function renderAnalysisRepositoryList() {
+    return (
+      <ol className="analysis-repository-order-list">
+        {orderedCodexRepositories.map((repository, index) => (
+          <li key={repository.projectId} className="analysis-repository-order-item">
+            <span className="analysis-repository-order-index">{index + 1}</span>
+            <span className="analysis-repository-order-copy">
+              <strong>{repository.name}</strong>
+              <span title={repository.workspacePath}>{repository.workspacePath}</span>
+              <small>{repository.currentBranch ? `当前分支：${repository.currentBranch}` : "未检测到当前分支"} · {repository.branches.length} 个本地分支</small>
+            </span>
+            <span className="analysis-repository-order-actions">
+              <button
+                type="button"
+                aria-label={`将 ${repository.name} 上移`}
+                disabled={index === 0}
+                onClick={() => moveAnalysisRepository(repository.projectId, -1)}
+              >
+                上移
+              </button>
+              <button
+                type="button"
+                aria-label={`将 ${repository.name} 下移`}
+                disabled={index === orderedCodexRepositories.length - 1}
+                onClick={() => moveAnalysisRepository(repository.projectId, 1)}
+              >
+                下移
+              </button>
+            </span>
+          </li>
+        ))}
+      </ol>
+    );
+  }
+
   const contextName = workspaceName(hostContext?.workspacePath);
   const headerProjectName = selectedProject?.name ?? "任务面板";
   const appShellStyle = embedded
@@ -1812,8 +1931,8 @@ export function App() {
     : undefined;
 
   return (
-    <div className={`app-shell${embedded ? " embedded" : ""}`} style={appShellStyle}>
-      {taskboardMetadata && taskboardMetadata.mode !== "cloud" && (
+    <div className={`app-shell${embedded ? " embedded" : ""}${isTomatoBoard ? " tomato-board" : ""}`} style={appShellStyle}>
+      {taskboardMetadata && (
         <LocalRealtimeSync
           selectedProjectId={selectedProjectId}
           detailTaskId={detailTaskId}
@@ -1825,8 +1944,8 @@ export function App() {
           setAttachmentsRevision={setAttachmentsRevision}
         />
       )}
-      {!embedded && (
-        <aside className="app-nav" aria-label="Taskboard navigation">
+      {!embedded && !isTomatoBoard && (
+        <aside className="app-nav" aria-label="工作台导航">
           <div className="brand-row">
             <span className="brand-mark" aria-hidden="true"><LinearIcon name="project" /></span>
             <span>任务面板</span>
@@ -1904,7 +2023,7 @@ export function App() {
                   <LinearIcon name="codexSidebarExpand" />
                 </button>
               )}
-              {selectedProjectId && (
+              {selectedProjectId && !isTomatoBoard && (
                 <button
                   className="detail-back-button project-home-button"
                   type="button"
@@ -1916,8 +2035,13 @@ export function App() {
                   <span>首页</span>
                 </button>
               )}
-              {selectedProjectId && <span className="breadcrumb-chevron" aria-hidden="true"><LinearIcon name="chevronRight" /></span>}
-              {selectedProjectId ? (
+              {selectedProjectId && !isTomatoBoard && <span className="breadcrumb-chevron" aria-hidden="true"><LinearIcon name="chevronRight" /></span>}
+              {isTomatoBoard ? (
+                <>
+                  <span className="project-avatar" aria-hidden="true">番</span>
+                  <span className="project-name">番茄工作台</span>
+                </>
+              ) : selectedProjectId ? (
                 <div className="header-project-switcher" data-project-switcher>
                   <button
                     className="header-project-button"
@@ -1971,7 +2095,7 @@ export function App() {
                   <strong>项目</strong>
                 </>
               )}
-              {!detailTask && selectedProjectId && (
+              {!detailTask && selectedProjectId && !isTomatoBoard && (
                 <button
                   className={`favorite-button${favoriteProjectIds.has(selectedProjectId) ? " active" : ""}`}
                   type="button"
@@ -1983,24 +2107,36 @@ export function App() {
                   <LinearIcon className="favorite-icon" name="favorite" />
                 </button>
               )}
-              {!detailTask && selectedProjectId && embedded && contextName && <span className="codex-context">{contextName}</span>}
+              {!detailTask && selectedProjectId && !isTomatoBoard && embedded && contextName && <span className="codex-context">{contextName}</span>}
             </div>
           </div>
 
           <div ref={dragRegionRef} className="workspace-drag-region" aria-hidden="true" />
 
           <div className="header-actions">
-            {selectedProjectId && (
-              <ProjectAutomationMenu
-                automation={selectedProjectAutomation}
-                pending={automationPending}
-                error={automationError}
-                unavailableReason={automationProjectContext.unavailableReason}
-                onOpen={() => void reconcileProjectAutomation()}
-                onChange={(options) => void saveProjectAutomation(options)}
-              />
+            <button
+              className="icon-button page-reload-button"
+              type="button"
+              aria-label="重载页面"
+              title="重载页面"
+              onClick={() => window.location.reload()}
+            >
+              重载
+            </button>
+            {isTomatoBoard && !detailTask && (
+              <button
+                className="icon-button header-repository-button"
+                type="button"
+                aria-haspopup="dialog"
+                aria-expanded={analysisRepositoryDialogOpen}
+                aria-label="仓库管理"
+                title="管理番茄 Bug 分析仓库"
+                onClick={() => setAnalysisRepositoryDialogOpen(true)}
+              >
+                仓库管理
+              </button>
             )}
-            {selectedProjectId && boardView === "issues" && (
+            {selectedProjectId && !isTomatoBoard && boardView === "issues" && (
               <button
                 className="icon-button header-create-button"
                 type="button"
@@ -2017,8 +2153,46 @@ export function App() {
           <div ref={dragRegionRef} className="home-window-drag-region" aria-hidden="true" />
         )}
 
+        {analysisRepositoryDialogOpen && isTomatoBoard && !detailTask && (
+          <div
+            className="analysis-repository-dialog-backdrop"
+            role="presentation"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) setAnalysisRepositoryDialogOpen(false);
+            }}
+          >
+            <section
+              className="analysis-repository-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="analysis-repository-dialog-heading"
+              onMouseDown={(event) => event.stopPropagation()}
+            >
+              <header className="analysis-repository-dialog-heading">
+                <div>
+                  <span>番茄 Bug 分析</span>
+                  <h2 id="analysis-repository-dialog-heading">仓库管理</h2>
+                  <p>按这里的顺序依次取证；前一个仓库证据不足时才会继续检查下一个。</p>
+                </div>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label="关闭仓库管理"
+                  title="关闭"
+                  onClick={() => setAnalysisRepositoryDialogOpen(false)}
+                >
+                  <LinearIcon name="close" />
+                </button>
+              </header>
+              {orderedCodexRepositories.length > 0
+                ? renderAnalysisRepositoryList()
+                : <p className="analysis-repository-dialog-empty">暂未发现 Codex 本地仓库。</p>}
+            </section>
+          </div>
+        )}
+
         {selectedProjectId && !detailTask && <div className="board-toolbar">
-          <div className="view-tabs" aria-label="看板视图">
+          {!isTomatoBoard && <div className="view-tabs" aria-label="看板视图">
             <button
               className={`view-tab${boardView === "issues" ? " active" : ""}`}
               type="button"
@@ -2037,59 +2211,148 @@ export function App() {
                 节点模式
               </button>
             )}
-          </div>
+          </div>}
           {boardView === "issues" && <div className="toolbar-tools">
-            <label className={`search-field${search ? " has-value" : ""}`} title="搜索议题 (/)" >
-              <LinearIcon className="search-icon" name="search" />
-              <span className="sr-only">搜索议题</span>
-              <input
-                id="task-search"
-                type="search"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="搜索议题…"
-              />
-              {!search && <kbd>/</kbd>}
-            </label>
-            <TaskFilterMenu
-              tasks={tasks}
-              search={search}
-              labels={availableLabels}
-              filters={filters}
-              onChange={setFilters}
-            />
-            <BoardSettingsMenu
-              showEmptyColumns={showEmptyColumns}
-              onShowEmptyColumnsChange={updateShowEmptyColumns}
-            />
-            {(search || activeFilterCount > 0) && (
-              <button
-                className="clear-filter"
-                type="button"
-                aria-label="清除筛选"
-                title="清除筛选"
-                onClick={() => { setSearch(""); setFilters(EMPTY_TASK_FILTERS); }}
-              >
-                <LinearIcon name="close" />
-              </button>
+            {isTomatoBoard && (
+              <>
+                <label className={`search-field tomato-search-field${search ? " has-value" : ""}`} title="搜索标题或 tag (/)" >
+                  <LinearIcon className="search-icon" name="search" />
+                  <span className="sr-only">搜索标题或 tag</span>
+                  <input
+                    id="task-search"
+                    type="search"
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                    placeholder="搜索标题或 tag…"
+                  />
+                  {!search && <kbd>/</kbd>}
+                </label>
+                <button
+                  className={`icon-button tomato-analysis-start-button${tomatoAnalysisProgress.running ? " is-running" : ""}`}
+                  type="button"
+                  disabled={tomatoSyncing || tomatoAnalysisStarting}
+                  aria-label={tomatoAnalysisStarting ? "正在启动番茄 Bug 分析" : tomatoAnalysisProgress.running ? "查看番茄 Bug 分析过程" : "手动触发番茄 Bug 分析"}
+                  aria-busy={tomatoAnalysisStarting}
+                  title={tomatoAnalysisProgress.running ? "查看分析过程" : "立即分析番茄 Bug"}
+                  onClick={() => tomatoAnalysisProgress.running
+                    ? setTomatoAnalysisPanelOpen((open) => !open)
+                    : void startTomatoAnalysis()}
+                >
+                  <LinearIcon name={tomatoAnalysisProgress.running ? "conversation" : "play"} />
+                </button>
+                <button
+                  className="icon-button tomato-sync-button"
+                  type="button"
+                  disabled={tomatoSyncing}
+                  aria-label={tomatoSyncing ? "正在刷新番茄卡片" : "刷新番茄卡片"}
+                  aria-busy={tomatoSyncing}
+                  title={tomatoSyncing ? "正在通过番茄 CLI 同步…" : "从番茄刷新"}
+                  onClick={() => void refreshTomato()}
+                >
+                  <LinearIcon className={tomatoSyncing ? "tomato-sync-icon spinning" : "tomato-sync-icon"} name="sync" />
+                </button>
+              </>
+            )}
+            {!isTomatoBoard && (
+              <>
+                <label className={`search-field${search ? " has-value" : ""}`} title="搜索议题 (/)" >
+                  <LinearIcon className="search-icon" name="search" />
+                  <span className="sr-only">搜索议题</span>
+                  <input
+                    id="task-search"
+                    type="search"
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                    placeholder="搜索议题…"
+                  />
+                  {!search && <kbd>/</kbd>}
+                </label>
+                <TaskFilterMenu
+                  tasks={tasks}
+                  search={search}
+                  labels={availableLabels}
+                  filters={filters}
+                  onChange={setFilters}
+                />
+                <BoardSettingsMenu
+                  showEmptyColumns={showEmptyColumns}
+                  onShowEmptyColumnsChange={updateShowEmptyColumns}
+                />
+                {(search || activeFilterCount > 0) && (
+                  <button
+                    className="clear-filter"
+                    type="button"
+                    aria-label="清除筛选"
+                    title="清除筛选"
+                    onClick={() => { setSearch(""); setFilters(EMPTY_TASK_FILTERS); }}
+                  >
+                    <LinearIcon name="close" />
+                  </button>
+                )}
+              </>
             )}
           </div>}
         </div>}
 
+        {isTomatoBoard && tomatoAnalysisProgress.running && !detailTask && (
+          <div className="tomato-analysis-progress" role="status" aria-live="polite">
+          <div className="tomato-analysis-progress-copy">
+              <span>AI 分析中</span>
+              <strong>{tomatoAnalysisProgress.itemKey ?? "正在读取候选卡片"}</strong>
+          </div>
+          <button className="tomato-analysis-stop" type="button" onClick={() => void stopTomatoAnalysis()}>
+            停止分析
+          </button>
+          <div className="tomato-analysis-progress-track" aria-hidden="true"><span /></div>
+          </div>
+        )}
+
+        {isTomatoBoard && tomatoAnalysisPanelOpen && !detailTask && (
+          <aside className="tomato-analysis-process" aria-label="Codex 分析过程">
+            <header>
+              <div><span>Codex 分析过程</span><strong>{tomatoAnalysisProgress.itemKey ?? "准备候选卡片"}</strong></div>
+              <div className="tomato-analysis-process-actions">
+                {tomatoAnalysisProgress.running && <button type="button" className="tomato-analysis-stop" onClick={() => void stopTomatoAnalysis()}>停止分析</button>}
+                {!tomatoAnalysisProgress.running && <button type="button" className="tomato-analysis-restart" disabled={tomatoAnalysisStarting} onClick={() => void startTomatoAnalysis()}>重新分析</button>}
+                <button type="button" className="icon-button" aria-label="关闭分析过程" onClick={() => setTomatoAnalysisPanelOpen(false)}><LinearIcon name="close" /></button>
+              </div>
+            </header>
+            <div className="tomato-analysis-process-events">
+              {tomatoAnalysisProgress.messages.length > 0
+                ? tomatoAnalysisProgress.messages.map((message) => <article key={message.at} className="is-assistant"><span>关键进度</span><p>{message.content}</p></article>)
+                : tomatoAnalysisEvents.filter((event) => event.role === "assistant" || event.role === "error").length === 0
+                  ? <p>正在等待关键进度…</p>
+                  : tomatoAnalysisEvents.filter((event) => event.role === "assistant" || event.role === "error").map((event) => (
+                  <article key={event.id} className={`is-${event.role}`}>
+                    <span>{event.role === "assistant" ? "Codex 结论" : "错误"}</span>
+                    <p>{event.content}</p>
+                  </article>
+                ))}
+            </div>
+          </aside>
+        )}
+
         {(loadError || actionError) && (
           <div className="error-banner" role="alert">
             <span className="error-mark" aria-hidden="true"><LinearIcon name="alert" /></span>
-            <div><strong>Taskboard needs attention</strong><p>{actionError ?? loadError}</p></div>
-            <button
-              type="button"
-              onClick={() => {
-                setActionError(null);
-                if (selectedProjectId) void refreshTasks(selectedProjectId);
-                else void loadProjectList();
-              }}
-            >
-              Try again
-            </button>
+            <div><strong>工作台需要处理</strong><p>{actionError ?? loadError}</p></div>
+            <div className="error-actions">
+              <button type="button" onClick={() => void copyError()}>
+                {errorCopied ? "已复制" : "复制"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActionError(null);
+                  if (!actionError) {
+                    if (selectedProjectId) void refreshTasks(selectedProjectId);
+                    else void loadProjectList();
+                  }
+                }}
+              >
+                {actionError ? "关闭" : "重试"}
+              </button>
+            </div>
           </div>
         )}
 
@@ -2171,6 +2434,53 @@ export function App() {
               </div>
             )}
           </section>
+        ) : detailTask && selectedProject && isTomatoBoard ? (
+          <TomatoTaskDetail
+            task={detailTask}
+            tomatoConfig={taskboardMetadata?.tomato}
+            onAgentTransition={async (itemKey, targetStatus) => (
+              await tomatoAiChatRef.current?.startSkillAction({
+                skillId: "tomato-bug-transition",
+                message: `请使用 tomato-bug-transition skill，将番茄事项 ${itemKey} 流转到「${targetStatus}」。先读取事项详情和当前卡片的对话、评论及修复记录，按 skill 补齐必填字段；如果业务事实不足，先向我确认。完成流转后回读事项状态并验证。`,
+              }) ?? false
+            )}
+            onTransitionComplete={async () => {
+              await Promise.all([
+                refreshTasks("tomato", { quiet: true }),
+                refreshProjectList(),
+              ]);
+            }}
+            onExternalLinkFallback={(url) => void copyText(url, "番茄链接已复制")}
+            onCopyLink={(url) => void copyText(url, "番茄链接已复制")}
+            onError={setActionError}
+            onAnnounce={setAnnouncement}
+            repositoryOptions={tomatoRepositoryOptions}
+            repositoryConfigs={(detailTask.tomatoRepositories ?? []).length > 0
+              ? detailTask.tomatoRepositories ?? []
+              : detailTask.repositoryProjectId
+                ? [{ projectId: detailTask.repositoryProjectId, developmentBranch: "", rebaseBranch: "" }]
+                : []}
+            onRepositoryConfigsChange={(configs) => void updateTomatoRepositoryConfigs(configs)}
+            onToggleAnalysis={() => void toggleTomatoAnalysis(detailTask)}
+            onOneClickFix={() => void oneClickFixTomatoTask(detailTask)}
+            onSubmitFix={() => void submitTomatoFix(detailTask)}
+            conversation={(
+              <AiChat
+                ref={tomatoAiChatRef}
+                available={localAiChatAvailable}
+                projectId={selectedProjectId || null}
+                issueId={detailTaskId}
+                issueIdentifier={tomatoItemKeyFromTask(detailTask)}
+                repositoryProjectId={tomatoRepositoryProjectId || null}
+                repositoryOptions={tomatoRepositoryOptions}
+                repositoryLoading={tomatoRepositoryLoading}
+                onRepositoryChange={(projectId) => void selectTomatoRepository(projectId)}
+                hideRepositoryPicker
+                inline
+                onOpenThread={openThread}
+              />
+            )}
+          />
         ) : detailTask && selectedProject ? (
           <TaskDetail
             key={detailTask.id}
@@ -2237,7 +2547,19 @@ export function App() {
                   </button>
                 </section>
               )}
-              {visibleStatuses.map((status) => (
+              {isTomatoBoard ? tomatoVisibleStatuses.map((status) => (
+                <TomatoStatusColumn
+                  key={status}
+                  status={status}
+                  tomatoConfig={taskboardMetadata?.tomato}
+                  tasks={tomatoTasksByStatus.get(status) ?? []}
+                  contextMenuTaskId={contextMenu?.taskId ?? null}
+                  onEdit={openTaskDetail}
+                  onCopyLink={(url) => void copyText(url, "番茄卡片链接已复制。")}
+                  conversationByItemKey={tomatoConversationByItemKey}
+                  onToggleAnalysis={(task) => void toggleTomatoAnalysis(task)}
+                />
+              )) : visibleStatuses.map((status) => (
                 <BoardColumn
                   key={status}
                   status={status}
@@ -2269,7 +2591,7 @@ export function App() {
                   onHide={(hiddenStatus) => updateColumnVisibility(hiddenStatus, false)}
                 />
               ))}
-              {hiddenStatuses.length > 0 && (
+              {!isTomatoBoard && hiddenStatuses.length > 0 && (
                 <HiddenColumns
                   statuses={hiddenStatuses}
                   counts={Object.fromEntries(
@@ -2326,11 +2648,14 @@ export function App() {
         />
       )}
 
-      <AiChat
-        available={localAiChatAvailable}
-        projectId={selectedProjectId || null}
-        issueId={detailTaskId}
-      />
+      {!isTomatoBoard && (
+        <AiChat
+          available={localAiChatAvailable}
+          projectId={selectedProjectId || null}
+          issueId={detailTaskId}
+          onOpenThread={openThread}
+        />
+      )}
 
       <div className="sr-only" role="status" aria-live="polite">{announcement}</div>
       {undoNotice && (
@@ -2354,4 +2679,81 @@ export function App() {
       {draggedTaskId && <div className="drag-hint" aria-hidden="true">拖到目标位置后松开</div>}
     </div>
   );
+}
+
+
+export function App() {
+  const [session, setSession] = useState<TomatoSession | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refreshSession = useCallback(async (signal?: AbortSignal) => {
+    setLoading(true);
+    try {
+      setSession(await getTomatoSession(signal));
+      setError(null);
+    } catch (nextError) {
+      if (!(nextError instanceof Error && nextError.name === "AbortError")) {
+        setError(nextError instanceof Error ? nextError.message : "无法读取 Gitee 登录状态。");
+      }
+    } finally {
+      if (!signal?.aborted) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void refreshSession(controller.signal);
+    const handleAuthRequired = () => {
+      setSession(null);
+      setError("Gitee 登录状态已失效，请重新登录。");
+      setLoading(false);
+    };
+    window.addEventListener("tomato-auth-required", handleAuthRequired);
+    return () => {
+      controller.abort();
+      window.removeEventListener("tomato-auth-required", handleAuthRequired);
+    };
+  }, [refreshSession]);
+
+  const handleLogin = useCallback(async (token: string) => {
+    setBusy(true);
+    try {
+      const nextSession = await loginTomato(token);
+      setSession(nextSession);
+      setError(null);
+      return nextSession;
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const handleSwitchContext = useCallback(async (contextId: string) => {
+    setBusy(true);
+    try {
+      const nextSession = await switchTomatoContext(contextId);
+      setSession(nextSession);
+      setError(null);
+      return nextSession;
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  if (loading) {
+    return <main className="tomato-auth-shell"><div className="tomato-auth-loading">正在检查 Gitee CLI 登录状态…</div></main>;
+  }
+  if (session?.authenticated !== true || !session.context) {
+    return (
+      <TomatoLoginPage
+        session={session}
+        error={error}
+        busy={busy}
+        onLogin={handleLogin}
+        onSwitchContext={handleSwitchContext}
+      />
+    );
+  }
+  return <TaskboardApp />;
 }

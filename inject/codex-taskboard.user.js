@@ -1,11 +1,13 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.6.8";
+  const VERSION = "0.7.0";
   const SOURCE_HASH = window.__CODEX_TASKBOARD_SOURCE_HASH__;
   const SENTINEL_KEY = "__codexTaskboardInjection__";
   const DEFAULT_TASKBOARD_URL = "http://127.0.0.1:47823/?host=codex";
   const ENTRY_ID = "codex-taskboard-entry";
+  const LIFE_ENTRY_ID = "codex-life-helper-entry";
+  const DEFAULT_LIFE_HELPER_URL = "http://127.0.0.1:47824/?host=codex";
   const PAGE_ID = "codex-taskboard-page";
   const FRAME_ID = "codex-taskboard-frame";
   const DRAG_REGION_ID = "codex-taskboard-drag-region";
@@ -17,6 +19,7 @@
   const HIDDEN_ATTRIBUTE = "data-codex-taskboard-native-hidden";
   const HOST_ATTRIBUTE = "data-codex-taskboard-page-host";
   const NATIVE_SELECTED_ATTRIBUTE = "data-codex-taskboard-native-selected";
+  const ACTIVE_ENTRY_ATTRIBUTE = "data-codex-embedded-active";
   const HOST_BINDING_NAME = "__codexTaskboardHostV1";
   const HOST_HEARTBEAT_NAME = "__codexTaskboardHostHeartbeatV1";
   const REATTACH_DELAY_MS = 160;
@@ -52,6 +55,7 @@
   } catch (_) {}
 
   let entry = null;
+  let lifeEntry = null;
   let page = null;
   let frame = null;
   let dragRegion = null;
@@ -72,6 +76,7 @@
   let pendingThreadCreation = null;
   let lastNativeThreadId = "";
   let active = false;
+  let activeApp = "taskboard";
   let destroyed = false;
 
   function normalizedLabel(value) {
@@ -98,6 +103,20 @@
     }
   }
 
+  function resolveLifeHelperUrl() {
+    const configured = typeof window.__CODEX_LIFE_HELPER_URL__ === "string"
+      ? window.__CODEX_LIFE_HELPER_URL__.trim()
+      : "";
+    try {
+      const url = new URL(configured || DEFAULT_LIFE_HELPER_URL);
+      if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Unsupported URL");
+      if (!url.searchParams.has("host")) url.searchParams.set("host", "codex");
+      return url;
+    } catch (_) {
+      return new URL(DEFAULT_LIFE_HELPER_URL);
+    }
+  }
+
   function isLocalTaskboardOrigin(origin) {
     try {
       const { protocol, hostname } = new URL(origin);
@@ -114,18 +133,21 @@
     style.id = STYLE_ID;
     style.setAttribute(OWNED_ATTRIBUTE, "true");
     style.textContent = `
-      #${ENTRY_ID}[aria-current="page"] {
+      #${ENTRY_ID}[${ACTIVE_ENTRY_ATTRIBUTE}="true"],
+      #${LIFE_ENTRY_ID}[${ACTIVE_ENTRY_ATTRIBUTE}="true"] {
         background: var(--color-token-list-hover-background, color-mix(in srgb, currentColor 8%, transparent));
         color: var(--color-token-foreground, inherit);
       }
-      #${ENTRY_ID}:focus-visible {
+      #${ENTRY_ID}:focus-visible,
+      #${LIFE_ENTRY_ID}:focus-visible {
         outline: 2px solid var(--color-token-border, Highlight);
         outline-offset: 2px;
       }
       [${HOST_ATTRIBUTE}="true"] {
         position: relative !important;
         z-index: 31 !important;
-        pointer-events: none !important;
+        pointer-events: auto !important;
+        -webkit-app-region: no-drag;
       }
       [${HIDDEN_ATTRIBUTE}="true"] {
         visibility: hidden !important;
@@ -150,6 +172,7 @@
         background: Canvas;
         color: CanvasText;
         pointer-events: auto;
+        -webkit-app-region: no-drag;
       }
       #${PAGE_ID}[hidden] {
         display: none !important;
@@ -160,6 +183,8 @@
         height: 100%;
         border: 0;
         background: Canvas;
+        pointer-events: auto;
+        -webkit-app-region: no-drag;
       }
       #${FRAME_ID}[hidden] {
         display: none !important;
@@ -221,10 +246,7 @@
     if (!scroll) return null;
     const buttons = Array.from(scroll.querySelectorAll("button"));
     const plugin = buttons.find((button) => buttonMatches(button, PLUGIN_LABELS));
-    if (plugin && plugin.parentElement) {
-      const siblings = Array.from(plugin.parentElement.children).filter((child) => child.tagName === "BUTTON");
-      if (siblings.length >= 3) return plugin;
-    }
+    if (plugin?.parentElement) return plugin;
 
     const firstSection = scroll.querySelector("[data-app-action-sidebar-section]");
     const sectionTop = firstSection?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY;
@@ -251,6 +273,18 @@
     `;
   }
 
+  function replaceLifeEntryIcon(button) {
+    const icon = button.querySelector("svg");
+    if (!icon) return;
+    icon.setAttribute("viewBox", "0 0 24 24");
+    icon.setAttribute("fill", "none");
+    icon.setAttribute("stroke", "currentColor");
+    icon.setAttribute("stroke-width", "1.8");
+    icon.setAttribute("stroke-linecap", "round");
+    icon.setAttribute("stroke-linejoin", "round");
+    icon.innerHTML = `<path d="M12 21s7-4.6 7-11a4 4 0 0 0-7-2.7A4 4 0 0 0 5 10c0 6.4 7 11 7 11Z"></path><path d="M9 12h2l1-2 1.5 4 1-2H17"></path>`;
+  }
+
   function createEntry(reference) {
     const button = reference.cloneNode(true);
     button.id = ENTRY_ID;
@@ -260,14 +294,14 @@
     button.removeAttribute("aria-controls");
     button.removeAttribute("aria-describedby");
     button.removeAttribute("data-state");
-    button.setAttribute("aria-label", "打开任务面板");
-    button.setAttribute("title", "任务面板");
+    button.setAttribute("aria-label", "打开番茄工作台");
+    button.setAttribute("title", "番茄工作台");
     button.setAttribute(OWNED_ATTRIBUTE, "true");
     button.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
     const label = button.querySelector(".text-fade-truncate")
       || Array.from(button.querySelectorAll("span")).find((node) => buttonMatches(node, PLUGIN_LABELS));
-    if (label) label.textContent = "任务面板";
-    else button.textContent = "任务面板";
+    if (label) label.textContent = "番茄工作台";
+    else button.textContent = "番茄工作台";
     replaceEntryIcon(button);
     button.addEventListener("click", (event) => {
       event.preventDefault();
@@ -277,12 +311,50 @@
     return button;
   }
 
+  function createLifeEntry(reference) {
+    const button = reference.cloneNode(true);
+    button.id = LIFE_ENTRY_ID;
+    button.type = "button";
+    button.removeAttribute("disabled");
+    button.removeAttribute("aria-expanded");
+    button.removeAttribute("aria-controls");
+    button.removeAttribute("aria-describedby");
+    button.removeAttribute("data-state");
+    button.setAttribute("aria-label", "打开生活助手");
+    button.setAttribute("title", "生活助手");
+    button.setAttribute(OWNED_ATTRIBUTE, "true");
+    button.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
+    const label = button.querySelector(".text-fade-truncate")
+      || Array.from(button.querySelectorAll("span")).find((node) => buttonMatches(node, PLUGIN_LABELS));
+    if (label) label.textContent = "生活助手";
+    else button.textContent = "生活助手";
+    replaceLifeEntryIcon(button);
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openLifeHelper();
+    });
+    return button;
+  }
+
   function syncEntryState() {
-    if (!entry) return;
-    if (active && entry.getAttribute("aria-current") !== "page") {
-      entry.setAttribute("aria-current", "page");
-    } else if (!active && entry.hasAttribute("aria-current")) {
-      entry.removeAttribute("aria-current");
+    if (entry) {
+      if (active && activeApp === "taskboard") {
+        entry.setAttribute("aria-current", "page");
+        entry.setAttribute(ACTIVE_ENTRY_ATTRIBUTE, "true");
+      } else {
+        entry.removeAttribute("aria-current");
+        entry.removeAttribute(ACTIVE_ENTRY_ATTRIBUTE);
+      }
+    }
+    if (lifeEntry) {
+      if (active && activeApp === "life-helper") {
+        lifeEntry.setAttribute("aria-current", "page");
+        lifeEntry.setAttribute(ACTIVE_ENTRY_ATTRIBUTE, "true");
+      } else {
+        lifeEntry.removeAttribute("aria-current");
+        lifeEntry.removeAttribute(ACTIVE_ENTRY_ATTRIBUTE);
+      }
     }
   }
 
@@ -292,26 +364,30 @@
     const reference = findReferenceButton();
     if (!reference?.parentElement) return;
     if (!entry) entry = createEntry(reference);
+    if (!lifeEntry) lifeEntry = createLifeEntry(reference);
     if (entry.parentElement !== reference.parentElement || entry.previousElementSibling !== reference) {
       reference.after(entry);
+    }
+    if (lifeEntry.parentElement !== reference.parentElement || lifeEntry.previousElementSibling !== entry) {
+      entry.after(lifeEntry);
     }
     syncEntryState();
   }
 
   function findPageHost() {
-    const direct = document.querySelector(".app-shell-main-content-frame");
+    const direct = document.querySelector(
+      "[data-app-shell-thread-edge-divider], .app-shell-main-content-frame",
+    );
     if (direct?.closest?.("[data-app-shell-main-content-layout]")) return direct;
 
     const viewport = document.querySelector("[data-app-shell-main-content-layout]");
     if (!viewport) return null;
     const viewportRect = viewport.getBoundingClientRect();
-    const headerBottom = document.querySelector("main > header")?.getBoundingClientRect().bottom
-      ?? viewportRect.top;
     return Array.from(viewport.children).find((candidate) => {
       const rect = candidate.getBoundingClientRect();
       return rect.width >= viewportRect.width * 0.8
         && rect.height >= viewportRect.height * 0.7
-        && rect.top >= headerBottom - 1;
+        && rect.top >= viewportRect.top - 1;
     }) || null;
   }
 
@@ -583,6 +659,11 @@
     return `/local/${encodeURIComponent(threadId)}`;
   }
 
+  function routeForReview(threadId) {
+    const query = new URLSearchParams({ view: "review", diffFilter: "last-turn" });
+    return `${routeForThread(threadId)}?${query}`;
+  }
+
   async function openThread(threadId) {
     if (typeof threadId !== "string" || !threadId.trim()) return;
     const normalizedThreadId = normalizeThreadId(threadId);
@@ -599,6 +680,19 @@
       await dispatchHostMessage({
         type: "navigate-to-route",
         path: routeForThread(normalizedThreadId),
+      });
+    } catch (_) {}
+  }
+
+  async function openReview(threadId) {
+    if (typeof threadId !== "string" || !threadId.trim()) return;
+    const normalizedThreadId = normalizeThreadId(threadId);
+    lastNativeThreadId = normalizedThreadId;
+    closeTaskboard(false);
+    try {
+      await dispatchHostMessage({
+        type: "navigate-to-route",
+        path: routeForReview(normalizedThreadId),
       });
     } catch (_) {}
   }
@@ -639,14 +733,14 @@
         const containsIdentifier = normalizedLabel(editor.textContent).includes(normalizedLabel(identifier));
         const skillMention = Array.from(editor.querySelectorAll("[skill-mention-name]"))
           .find((mention) => (
-            mention.getAttribute("skill-mention-name") === "manage-taskboard"
+            mention.getAttribute("skill-mention-name") === "tomato-workboard"
             && mention.getAttribute("skill-mention-path") === skillPath
           ));
         if (containsIdentifier && skillMention) return editor;
       }
       await new Promise((resolve) => window.setTimeout(resolve, 80));
     }
-    throw new Error("Codex 对话输入框没有生成 manage-taskboard Skill 引用");
+    throw new Error("Codex 对话输入框没有生成 tomato-workboard Skill 引用");
   }
 
   async function createThreadForTask(payload) {
@@ -727,64 +821,6 @@
     }
   }
 
-  function buildAutomationHostPayload(payload) {
-    return {
-      requestId: payload.requestId,
-      operation: payload.operation,
-      taskboardProjectId: payload.taskboardProjectId,
-      codexProjectId: payload.codexProjectId,
-      projectName: payload.projectName,
-      workspacePath: payload.workspacePath,
-      skillPath: payload.skillPath,
-      ...(payload.automationId === undefined ? {} : { automationId: payload.automationId }),
-      enabledByUser: payload.enabledByUser,
-      quotaAware: payload.quotaAware,
-      intervalMinutes: payload.intervalMinutes,
-      model: payload.model,
-      reasoningEffort: payload.reasoningEffort,
-    };
-  }
-
-  async function handleAutomationRequest(payload) {
-    const requestId = typeof payload?.requestId === "string" ? payload.requestId : "";
-    if (!requestId) return;
-    if (!isLocalTaskboardOrigin(frameOrigin)) {
-      postToFrame({
-        type: "taskboard:automation-response",
-        payload: { requestId, ok: false, error: "仅本地任务面板可用" },
-      });
-      return;
-    }
-    try {
-      const response = await requestHost(
-        "automation",
-        buildAutomationHostPayload(payload),
-      );
-      postToFrame({
-        type: "taskboard:automation-response",
-        payload: response.error
-          ? { requestId, ok: false, error: response.error }
-          : {
-              requestId,
-              ok: true,
-              item: response.item,
-              items: response.items,
-              quota: response.quota,
-              policy: response.policy,
-            },
-      });
-    } catch (error) {
-      postToFrame({
-        type: "taskboard:automation-response",
-        payload: {
-          requestId,
-          ok: false,
-          error: error instanceof Error ? error.message : "Codex 自动任务操作失败",
-        },
-      });
-    }
-  }
-
   function onFrameMessage(event) {
     if (!frame || event.source !== frame.contentWindow || event.origin !== frameOrigin) return;
     const message = event.data;
@@ -808,12 +844,12 @@
       void openThread(message.payload?.threadId);
       return;
     }
-    if (message.type === "taskboard:expand-sidebar") {
-      expandNativeSidebar();
+    if (message.type === "taskboard:open-review") {
+      void openReview(message.payload?.threadId);
       return;
     }
-    if (message.type === "taskboard:automation-request") {
-      void handleAutomationRequest(message.payload);
+    if (message.type === "taskboard:expand-sidebar") {
+      expandNativeSidebar();
       return;
     }
     if (message.type === "taskboard:create-thread") void createThreadForTask(message.payload);
@@ -886,7 +922,9 @@
 
   function showLoading() {
     if (!status) return;
-    status.replaceChildren(document.createTextNode("正在启动任务面板…"));
+    status.replaceChildren(document.createTextNode(
+      activeApp === "life-helper" ? "正在启动生活助手…" : "正在启动任务面板…",
+    ));
     status.hidden = false;
     if (frame) frame.hidden = true;
   }
@@ -963,10 +1001,40 @@
     page.appendChild(nextFrame);
   }
 
+  function loadLifeHelperFrame(cacheBust = false) {
+    cancelFrameReadyWaiters(new Error("生活助手正在重新加载"));
+    frame?.remove();
+    frame = null;
+    frameReady = false;
+    if (dragRegion) dragRegion.hidden = true;
+    if (noDragLeft) noDragLeft.hidden = true;
+    if (noDragRight) noDragRight.hidden = true;
+    const helperUrl = resolveLifeHelperUrl();
+    if (cacheBust) helperUrl.searchParams.set(FRAME_REFRESH_PARAM, Date.now().toString(36));
+    frameOrigin = helperUrl.origin;
+    const nextFrame = document.createElement("iframe");
+    nextFrame.id = FRAME_ID;
+    nextFrame.hidden = true;
+    nextFrame.src = helperUrl.href;
+    nextFrame.title = "生活助手";
+    nextFrame.referrerPolicy = "no-referrer";
+    nextFrame.setAttribute("allow", "clipboard-read; clipboard-write");
+    nextFrame.addEventListener("load", () => {
+      frameReady = true;
+      if (active && activeApp === "life-helper") showFrame();
+    });
+    frame = nextFrame;
+    page.appendChild(nextFrame);
+  }
+
   function reloadFrame() {
     if (!frame) return false;
     const generation = ++openGeneration;
     if (active) showLoading();
+    if (activeApp === "life-helper") {
+      loadLifeHelperFrame(true);
+      return true;
+    }
     loadTaskboardFrame(true);
     if (active) {
       void waitForFrameReady()
@@ -1004,7 +1072,7 @@
   function requestHost(action, payload = {}) {
     const binding = window[HOST_BINDING_NAME];
     if (!hasLiveHostBinding()) {
-      return Promise.reject(new Error("Taskboard 启动器未运行，无法操作 Codex 对话输入框"));
+      return Promise.reject(new Error("工作台启动器未运行，无法操作 Codex 对话输入框"));
     }
 
     const id = `${Date.now().toString(36)}-${(++hostRequestSequence).toString(36)}`;
@@ -1098,7 +1166,7 @@
       const bindingAvailable = hasLiveHostBinding();
       showLoadError(bindingAvailable
         ? error.message
-        : "任务面板服务未就绪。请保持 Taskboard 启动器运行后重试。");
+        : "任务面板服务未就绪。请保持工作台启动器运行后重试。");
     }
   }
 
@@ -1110,10 +1178,10 @@
   }
 
   function mountActivePage() {
-    if (!active) return;
+    if (!active) return false;
     if (!page) page = createPage();
     const mount = findPageMount();
-    if (!mount) return;
+    if (!mount) return false;
     const { surface } = mount;
 
     if (page.parentElement !== surface) {
@@ -1130,6 +1198,7 @@
     muteNativeSelection();
     page.hidden = false;
     document.documentElement.setAttribute("data-codex-taskboard-open", "true");
+    return true;
   }
 
   function closeTaskboard(restoreFocus = true) {
@@ -1146,23 +1215,61 @@
     hostContextSnapshot = null;
   }
 
-  function openTaskboard() {
+  async function waitForNativeThreadRelease(timeout = 2_000) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (!activeThreadRow() && !threadIdFromLocation()) return;
+      await new Promise((resolve) => window.setTimeout(resolve, 40));
+    }
+  }
+
+  async function openTaskboard() {
     if (destroyed) return;
+    const nativeThreadOpen = Boolean(activeThreadRow() || threadIdFromLocation());
     if (!active) {
       lastFocusedElement = document.activeElement;
       hostContextSnapshot = null;
     }
     const generation = ++openGeneration;
     active = true;
+    activeApp = "taskboard";
+    if (nativeThreadOpen) {
+      dispatchHostMessage({ type: "navigate-to-route", path: "/" });
+      await waitForNativeThreadRelease();
+      if (destroyed || generation !== openGeneration || !active || activeApp !== "taskboard") return;
+    }
     ensureEntry();
-    mountActivePage();
+    const mounted = mountActivePage();
+    if (!mounted) {
+      void dispatchHostMessage({
+        type: "navigate-to-route",
+        path: "/",
+      });
+    }
     syncEntryState();
     void prepareTaskboard(generation);
   }
 
+  function openLifeHelper() {
+    if (destroyed) return;
+    if (!active) lastFocusedElement = document.activeElement;
+    ++openGeneration;
+    active = true;
+    activeApp = "life-helper";
+    ensureEntry();
+    const mounted = mountActivePage();
+    if (!mounted) {
+      void dispatchHostMessage({ type: "navigate-to-route", path: "/" });
+    }
+    syncEntryState();
+    showLoading();
+    loadLifeHelperFrame();
+  }
+
   function isNativePageNavigation(target) {
     const clickable = target?.closest?.("button,a,[role='button'],[data-app-action-sidebar-thread-id]");
-    if (!clickable || clickable === entry || clickable.closest(`#${ENTRY_ID}`)) return false;
+    if (!clickable || clickable === entry || clickable === lifeEntry
+      || clickable.closest(`#${ENTRY_ID}`) || clickable.closest(`#${LIFE_ENTRY_ID}`)) return false;
     if (!clickable.closest("aside nav[role='navigation']")) return false;
     if (clickable.hasAttribute("data-app-action-sidebar-section-toggle")) return false;
     if (buttonMatches(clickable, NATIVE_PAGE_LABELS)) return true;
@@ -1240,6 +1347,7 @@
     closeTaskboard(false);
     document.querySelectorAll(`[${OWNED_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
     entry = null;
+    lifeEntry = null;
     page = null;
     frame = null;
     dragRegion = null;

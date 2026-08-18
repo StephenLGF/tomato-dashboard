@@ -128,6 +128,12 @@ test("common issue mutations enter a Linear-style undo queue", () => {
   assert.match(apiSource, /export async function restoreTask/);
 });
 
+test("action errors dismiss without pretending to retry the failed action", () => {
+  assert.match(appSource, /window\.setTimeout\(\(\) => setActionError\(null\), 8_000\)/);
+  assert.match(appSource, /\{actionError \? "关闭" : "重试"\}/);
+  assert.match(appSource, /if \(!actionError\) \{/);
+});
+
 test("issues expose processing conversations without manual binding", () => {
   assert.match(detailSource, /在对话中打开/);
   assert.match(detailSource, /onOpenInThread\(currentTask\)/);

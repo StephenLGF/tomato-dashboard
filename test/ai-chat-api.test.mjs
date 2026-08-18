@@ -25,7 +25,6 @@ const thread = {
     issueIdentifier: "LOCAL-103",
   },
   codexThreadId: null,
-  model: "codex-real",
   reasoningEffort: "high",
   sandbox: "read-only",
   createdAt: "2026-07-27T00:00:00.000Z",
@@ -91,12 +90,10 @@ test("local AI API client follows the fixed catalog, thread, turn and interrupt 
 
     assert.equal((await getAiChatThread("thread-1")).thread.id, "thread-1");
     await updateAiChatThread("thread-1", {
-      model: "codex-real",
       reasoningEffort: "high",
       sandbox: "workspace-write",
     });
     assert.deepEqual(JSON.parse(calls.at(-1).init.body), {
-      model: "codex-real",
       reasoningEffort: "high",
       sandbox: "workspace-write",
     });

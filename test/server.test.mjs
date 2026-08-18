@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -65,8 +65,11 @@ async function requestWithHost(baseUrl, host) {
 test("health and the default local project are available", async () => {
   let skillPath;
   const baseUrl = await startServer(async (directory) => {
-    skillPath = path.join(directory, "skills", "manage-taskboard", "SKILL.md");
-    return { skillPath };
+    skillPath = path.join(directory, "skills", "tomato-workboard", "SKILL.md");
+    return {
+      skillPath,
+      codexStatePath: path.join(directory, "missing-codex-state.json"),
+    };
   });
 
   const health = await request(baseUrl, "/health");
@@ -76,17 +79,42 @@ test("health and the default local project are available", async () => {
   const metadata = await request(baseUrl, "/api/meta");
   assert.equal(metadata.response.status, 200);
   assert.deepEqual(metadata.body, {
-    manageTaskboardSkillPath: skillPath,
+    tomatoWorkboardSkillPath: skillPath,
+    analysisRepositories: [],
+    tomato: { origin: "https://osc.gitee.work", tenant: "" },
     capabilities: { localAiChat: true },
+    mode: "local",
+    realtime: { transport: "poll", intervalMs: 2000 },
   });
 
   const result = await request(baseUrl, "/api/projects");
   assert.equal(result.response.status, 200);
-  assert.equal(result.body.projects.length, 1);
-  assert.equal(result.body.projects[0].id, "local");
-  assert.equal(result.body.projects[0].name, "Local");
+  assert.equal(result.body.projects.length, 2);
+  assert.deepEqual(result.body.projects.map(({ id, name }) => ({ id, name })), [
+    { id: "local", name: "Local" },
+    { id: "tomato", name: "番茄" },
+  ]);
   assert.equal(result.body.projects[0].workspacePath, null);
   assert.equal(result.body.projects[0].issueCount, 0);
+  assert.equal(result.body.projects[1].workspacePath, null);
+  assert.equal(result.body.projects[1].issueCount, 0);
+});
+
+test("the local Codex thread opener delegates deep links to the desktop host", async () => {
+  let openedThreadId = null;
+  const baseUrl = await startServer(async () => ({
+    openCodexThread: async (threadId) => {
+      openedThreadId = threadId;
+    },
+  }));
+
+  const result = await request(baseUrl, "/api/local/codex/threads/019fd280-cd58-79f1-bcf5-72116243cba4/open", {
+    method: "POST",
+  });
+
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.threadId, "019fd280-cd58-79f1-bcf5-72116243cba4");
+  assert.equal(openedThreadId, "019fd280-cd58-79f1-bcf5-72116243cba4");
 });
 
 test("workflow workspaces persist centrally with optimistic concurrency", async () => {
@@ -735,8 +763,8 @@ done
   assert.equal(result.response.status, 200);
   assert.deepEqual(result.body, {
     skills: [
-      { id: "repo-skill", label: "Repository Skill", scope: "repo" },
-      { id: "user-skill", label: "user-skill", scope: "user" },
+      { id: "repo-skill", label: "Repository Skill", description: "", path: "", scope: "repo" },
+      { id: "user-skill", label: "user-skill", description: "", path: "", scope: "user" },
     ],
     mcpServers: [
       { id: "context7", label: "context7", transport: "streamable_http" },
@@ -1006,13 +1034,19 @@ test("development context scan resolves the current Codex conversation workspace
   assert.equal(deviceResult.body.workspacePath, deviceWorkspace);
 });
 
-test("device workspaces come from this machine's Codex project roots", async () => {
+test("device workspaces and analysis repositories come from this machine's Codex project roots", async () => {
+  let projectA;
+  let projectB;
   const baseUrl = await startServer(async (directory) => {
+    projectA = path.join(directory, "project-a");
+    projectB = path.join(directory, "project-b");
+    await mkdir(projectA);
+    await mkdir(projectB);
     const codexStatePath = path.join(directory, "codex-state.json");
     await writeFile(codexStatePath, JSON.stringify({
       "local-projects": {
-        "local-project-a": { rootPaths: ["/Users/alice/project-a"] },
-        "local-project-b": { rootPaths: ["/Users/alice/project-b"] },
+        "local-project-a": { rootPaths: [projectA] },
+        "local-project-b": { rootPaths: [projectB, projectA] },
       },
     }));
     return { codexStatePath };
@@ -1020,9 +1054,32 @@ test("device workspaces come from this machine's Codex project roots", async () 
   const result = await request(baseUrl, "/api/device-workspaces");
   assert.equal(result.response.status, 200);
   assert.deepEqual(result.body.workspaces, {
-    "local-project-a": "/Users/alice/project-a",
-    "local-project-b": "/Users/alice/project-b",
+    "local-project-a": projectA,
+    "local-project-b": projectB,
   });
+
+  const metadata = await request(baseUrl, "/api/meta");
+  assert.equal(metadata.response.status, 200);
+  assert.deepEqual(metadata.body.analysisRepositories, [projectA, projectB]);
+
+  const repositories = await request(baseUrl, "/api/codex-repositories");
+  assert.equal(repositories.response.status, 200);
+  assert.deepEqual(repositories.body.repositories, [
+    {
+      projectId: "local-project-a",
+      name: "project-a",
+      workspacePath: projectA,
+      currentBranch: null,
+      branches: [],
+    },
+    {
+      projectId: "local-project-b",
+      name: "project-b",
+      workspacePath: projectB,
+      currentBranch: null,
+      branches: [],
+    },
+  ]);
 });
 
 test("accepts private LAN requests and rejects public Host and Origin headers", async () => {
@@ -1534,46 +1591,6 @@ test("issue comments can be created, edited, listed, and deleted", async () => {
   assert.equal(taskAfterDelete.body.task.threadId, null);
 });
 
-test("taskctl issue creation and comments use the Codex Agent identity", async () => {
-  const baseUrl = await startServer();
-  const agentHeaders = {
-    "x-taskboard-client": "taskctl",
-    "x-taskboard-user-id": "spoofed-user",
-    "x-taskboard-user-name": "Spoofed User",
-    "x-taskboard-user-avatar": "https://example.com/spoofed.png",
-  };
-  const createTaskResult = await request(baseUrl, "/api/tasks", {
-    method: "POST",
-    headers: agentHeaders,
-    body: { title: "Created by Codex", threadId: "thread-agent-create" },
-  });
-  assert.equal(createTaskResult.response.status, 201);
-  const task = createTaskResult.body.task;
-  assert.equal(task.creatorType, "agent");
-  assert.equal(task.creatorId, "codex-agent");
-  assert.equal(task.creatorName, "Codex Agent");
-  assert.equal(task.creatorAvatarUrl, null);
-  assert.deepEqual(task.assignee, {
-    type: "agent",
-    id: "codex-agent",
-    name: "Codex Agent",
-    avatarUrl: null,
-  });
-
-  const createCommentResult = await request(baseUrl, `/api/tasks/${task.id}/comments`, {
-    method: "POST",
-    headers: agentHeaders,
-    body: { body: "Implemented by Codex", threadId: "thread-agent-comment" },
-  });
-  assert.equal(createCommentResult.response.status, 201);
-  const comment = createCommentResult.body.comment;
-  assert.equal(comment.authorType, "agent");
-  assert.equal(comment.authorId, "codex-agent");
-  assert.equal(comment.authorName, "Codex Agent");
-  assert.equal(comment.authorAvatarUrl, null);
-  assert.equal(comment.threadId, "thread-agent-comment");
-});
-
 test("Codex-hosted user mutations persist the current account identity and avatar", async () => {
   const baseUrl = await startServer();
   const userHeaders = {
@@ -1633,10 +1650,10 @@ test("Codex-hosted user mutations persist the current account identity and avata
 
   const updatedByCodexResult = await request(baseUrl, `/api/tasks/${task.id}`, {
     method: "PATCH",
-    headers: { "x-taskboard-client": "taskctl" },
+    headers: userHeaders,
     body: {
       version: assignedToUserResult.body.task.version,
-      title: "Updated through taskctl",
+      title: "Updated through Codex",
     },
   });
   assert.equal(updatedByCodexResult.response.status, 200);

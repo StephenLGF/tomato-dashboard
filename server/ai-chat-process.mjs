@@ -156,7 +156,21 @@ function normalizedItem(rawType, item) {
   };
 }
 
-export function buildCodexArgs(thread, addDirectories, imagePaths = []) {
+export function buildCodexArgs(thread, addDirectories, imagePaths = [], launchModel = null) {
+  if (thread.codexThreadId) {
+    const args = ["exec", "resume", "--json"];
+    if (launchModel) args.push("-m", launchModel);
+    if (thread.sandbox === "danger-full-access") {
+      args.push("--dangerously-bypass-approvals-and-sandbox");
+    }
+    if (thread.reasoningEffort) {
+      args.push("-c", `model_reasoning_effort="${thread.reasoningEffort}"`);
+    }
+    for (const imagePath of imagePaths) args.push("-i", imagePath);
+    args.push(thread.codexThreadId, "-");
+    return args;
+  }
+
   const permission = thread.sandbox === "read-only"
     ? {
         sandbox: "workspace-write",
@@ -192,28 +206,18 @@ export function buildCodexArgs(thread, addDirectories, imagePaths = []) {
   for (const directory of addDirectories) {
     args.push("--add-dir", directory);
   }
-  if (thread.model) {
-    args.push("-m", thread.model);
+  if (launchModel) {
+    args.push("-m", launchModel);
   }
   if (thread.reasoningEffort) {
     args.push("-c", `model_reasoning_effort="${thread.reasoningEffort}"`);
   }
-  if (thread.codexThreadId) {
-    args.push("resume");
-    for (const imagePath of imagePaths) {
-      args.push("-i", imagePath);
-    }
-    args.push(thread.codexThreadId, "-");
-  } else {
-    for (const imagePath of imagePaths) {
-      args.push("-i", imagePath);
-    }
-    args.push("-");
-  }
+  for (const imagePath of imagePaths) args.push("-i", imagePath);
+  args.push("-");
   return args;
 }
 
-export function buildCodexPrompt(thread, { message, skills, attachmentPaths }, skillPath) {
+export function buildCodexPrompt(thread, { message, skills, attachmentPaths }) {
   const selectedSkills = skills ?? [];
   const turnAttachmentPaths = attachmentPaths ?? [];
   let selectedSkillIndex = 0;
@@ -241,8 +245,6 @@ export function buildCodexPrompt(thread, { message, skills, attachmentPaths }, s
   );
 
   return [
-    `[$manage-taskboard](${skillPath}) e-taskboard`,
-    "",
     "<taskboard_context>",
     ...context,
     "</taskboard_context>",
@@ -326,6 +328,298 @@ export function normalizeCodexEvent(raw) {
     return null;
   }
   return normalizedItem(raw.type, raw.item);
+}
+
+
+function appServerPermission(thread) {
+  if (thread.sandbox === "read-only") {
+    return { sandbox: "workspace-write", approvalPolicy: "on-request", approvalsReviewer: "user" };
+  }
+  if (thread.sandbox === "workspace-write") {
+    return { sandbox: "workspace-write", approvalPolicy: "on-request", approvalsReviewer: "auto_review" };
+  }
+  return { sandbox: "danger-full-access", approvalPolicy: "never", approvalsReviewer: null };
+}
+
+function appServerItemToExecItem(item) {
+  if (!item || typeof item !== "object") return null;
+  const base = { id: item.id };
+  switch (item.type) {
+    case "agentMessage":
+      return { ...base, type: "agent_message", text: item.text };
+    case "commandExecution":
+      return {
+        ...base,
+        type: "command_execution",
+        command: item.command,
+        aggregated_output: item.aggregatedOutput ?? item.output,
+        exit_code: item.exitCode,
+      };
+    case "fileChange":
+      return { ...base, type: "file_change", changes: item.changes };
+    case "mcpToolCall":
+      return {
+        ...base,
+        type: "mcp_tool_call",
+        server: item.server,
+        tool: item.tool,
+        arguments: item.arguments,
+        result: item.result,
+        error: item.error,
+      };
+    case "webSearch":
+      return { ...base, type: "web_search", query: item.query };
+    case "todoList":
+      return { ...base, type: "todo_list", items: item.items };
+    default:
+      return null;
+  }
+}
+
+function appServerUsageToExecUsage(usage) {
+  if (!usage || typeof usage !== "object") return undefined;
+  const last = usage.last ?? usage;
+  const result = {};
+  if (Number.isFinite(last.inputTokens)) result.input_tokens = last.inputTokens;
+  if (Number.isFinite(last.cachedInputTokens)) result.cached_input_tokens = last.cachedInputTokens;
+  if (Number.isFinite(last.outputTokens)) result.output_tokens = last.outputTokens;
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+export function spawnCodexAppServerTurn({
+  executable,
+  thread,
+  addDirectories = [],
+  imagePaths = [],
+  prompt,
+  model,
+  env,
+  onRawEvent,
+  maxLineBytes = 1_048_576,
+}) {
+  const child = spawn(executable, ["app-server", "--stdio"], {
+    cwd: thread.origin.workspacePath,
+    detached: true,
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const permission = appServerPermission(thread);
+  const runtimeWorkspaceRoots = [
+    ...new Set([thread.origin.workspacePath, ...addDirectories]),
+  ];
+  const input = [
+    { type: "text", text: prompt },
+    ...imagePaths.map((imagePath) => ({ type: "localImage", path: imagePath })),
+  ];
+
+  let stdoutBuffer = "";
+  let stderrBuffer = "";
+  let settled = false;
+  let turnStarted = false;
+  let terminal = false;
+  let threadId = thread.codexThreadId ?? null;
+  let requestId = 1;
+  let latestUsage;
+  let resolveCompletion;
+  let rejectCompletion;
+  const completion = new Promise((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+
+  function terminateProcessGroup(signal = "SIGTERM") {
+    if (Number.isInteger(child.pid)) {
+      try {
+        process.kill(-child.pid, signal);
+        return;
+      } catch {}
+    }
+    try {
+      child.kill(signal);
+    } catch {}
+  }
+
+  function finish(error = null, result = { exitCode: 0, signal: null }) {
+    if (settled) return;
+    settled = true;
+    if (error) {
+      if (stderrBuffer) error.stderr = stderrBuffer;
+      rejectCompletion(error);
+    } else {
+      resolveCompletion(result);
+    }
+    try {
+      child.stdin.end();
+    } catch {}
+    terminateProcessGroup();
+  }
+
+  function send(method, params, id = requestId++) {
+    if (settled) return id;
+    try {
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    } catch (error) {
+      finish(error);
+    }
+    return id;
+  }
+
+  function emit(raw) {
+    try {
+      onRawEvent(raw);
+    } catch (error) {
+      finish(error);
+    }
+  }
+
+  function emitThreadStarted(candidate) {
+    if (typeof candidate !== "string" || !candidate || threadId) return;
+    threadId = candidate;
+    emit({ type: "thread.started", thread_id: candidate });
+  }
+
+  function startThreadOrResume() {
+    if (threadId) {
+      send("thread/resume", {
+        threadId,
+        cwd: thread.origin.workspacePath,
+        sandbox: permission.sandbox,
+        approvalPolicy: permission.approvalPolicy,
+        approvalsReviewer: permission.approvalsReviewer,
+        runtimeWorkspaceRoots,
+      }, 2);
+      return;
+    }
+    send("thread/start", {
+      cwd: thread.origin.workspacePath,
+      model,
+      sandbox: permission.sandbox,
+      approvalPolicy: permission.approvalPolicy,
+      approvalsReviewer: permission.approvalsReviewer,
+      runtimeWorkspaceRoots,
+      threadSource: "vscode",
+      ephemeral: false,
+    }, 2);
+  }
+
+  function startTurn() {
+    send("turn/start", {
+      threadId,
+      input,
+      model,
+      effort: thread.reasoningEffort || null,
+    }, 3);
+  }
+
+  function handleAppServerMessage(message) {
+    if (!message || typeof message !== "object") return;
+    if (typeof message.method === "string" && message.id !== undefined) {
+      // The workbench has no interactive approval surface in this process. The
+      // existing full-access path never asks for approval; deny unknown requests
+      // rather than leaving the Codex process hanging forever.
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { approved: false } })}\n`);
+      return;
+    }
+    if (message.id === 1) {
+      if (message.error) {
+        finish(new Error(message.error.message || "Codex app-server rejected initialization"));
+        return;
+      }
+      try { child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} })}\n`); } catch (error) { finish(error); return; }
+      startThreadOrResume();
+      return;
+    }
+    if (message.id === 2) {
+      if (message.error) {
+        finish(new Error(message.error.message || "Codex app-server could not start or resume the thread"));
+        return;
+      }
+      emitThreadStarted(message.result?.thread?.id);
+      if (!threadId) {
+        finish(new Error("Codex app-server did not return a thread id"));
+        return;
+      }
+      startTurn();
+      return;
+    }
+    if (message.id === 3 && message.error) {
+      finish(new Error(message.error.message || "Codex app-server could not start the turn"));
+      return;
+    }
+
+    const method = message.method;
+    const params = message.params ?? {};
+    if (method === "thread/started") {
+      emitThreadStarted(params.thread?.id);
+      return;
+    }
+    if (method === "turn/started") {
+      turnStarted = true;
+      emit({ type: "turn.started" });
+      return;
+    }
+    if (method === "item/completed") {
+      const item = appServerItemToExecItem(params.item);
+      if (item) emit({ type: "item.completed", item });
+      return;
+    }
+    if (method === "thread/tokenUsage/updated") {
+      latestUsage = appServerUsageToExecUsage(params.tokenUsage);
+      return;
+    }
+    if (method === "turn/failed") {
+      terminal = true;
+      emit({ type: "turn.failed", error: params.turn?.error ?? params.error });
+      finish();
+      return;
+    }
+    if (method === "error") {
+      terminal = true;
+      emit({ type: "error", message: params.message ?? params.error });
+      finish();
+      return;
+    }
+    if (method === "thread/status/changed" && params.status?.type === "idle" && turnStarted && !terminal) {
+      terminal = true;
+      emit({ type: "turn.completed", usage: latestUsage });
+      finish();
+    }
+  }
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdoutBuffer += chunk;
+    if (stdoutBuffer.length > maxLineBytes * 2) {
+      finish(new Error(`Codex app-server JSONL exceeded ${maxLineBytes} bytes`));
+      return;
+    }
+    let newlineIndex = stdoutBuffer.indexOf("\n");
+    while (newlineIndex >= 0 && !settled) {
+      const line = stdoutBuffer.slice(0, newlineIndex).trim();
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+      if (line && line.length <= maxLineBytes) {
+        try { handleAppServerMessage(JSON.parse(line)); } catch (error) { finish(error); }
+      } else if (line) {
+        finish(new Error(`Codex app-server JSONL line exceeded ${maxLineBytes} bytes`));
+      }
+      newlineIndex = stdoutBuffer.indexOf("\n");
+    }
+  });
+  child.stderr.on("data", (chunk) => {
+    if (stderrBuffer.length < STDERR_LIMIT) stderrBuffer += String(chunk).slice(0, STDERR_LIMIT - stderrBuffer.length);
+  });
+  child.once("error", (error) => finish(error));
+  child.once("close", (exitCode, signal) => {
+    if (!settled) finish(null, { exitCode, signal });
+  });
+  child.once("spawn", () => {
+    send("initialize", {
+      clientInfo: { name: "codex-taskboard", version: "0.1.0" },
+      capabilities: { experimentalApi: true },
+    }, 1);
+  });
+
+  return { child, completion };
 }
 
 export function spawnCodexTurn({

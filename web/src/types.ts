@@ -26,6 +26,12 @@ export type DevelopmentContext =
   | { type: "branch"; branch: string }
   | { type: "worktree"; path: string; branch: string | null };
 
+export interface TomatoRepositoryConfig {
+  projectId: string;
+  developmentBranch: string;
+  rebaseBranch: string;
+}
+
 export type Recurrence = {
   interval: number;
   unit: "day" | "week" | "month" | "year";
@@ -36,16 +42,23 @@ export interface DevelopmentScan {
   contexts: DevelopmentContext[];
 }
 
+export interface CodexRepository {
+  projectId: string;
+  name: string;
+  workspacePath: string;
+  currentBranch: string | null;
+  branches: string[];
+}
+
 export interface TaskboardMetadata {
-  manageTaskboardSkillPath?: string;
+  tomatoWorkboardSkillPath?: string;
+  analysisRepositories?: string[];
+  tomato?: { origin: string; tenant: string };
   capabilities?: TaskboardCapabilities;
-  mode?: "local" | "cloud";
+  mode?: "local";
   realtime?: {
     transport: "poll";
     intervalMs: number;
-  };
-  localCapabilities?: {
-    available: boolean;
   };
 }
 
@@ -110,7 +123,7 @@ export interface AiChatThread {
   status: AiChatThreadStatus;
   origin: AiChatOrigin;
   codexThreadId: string | null;
-  model: string;
+  gitBranch: string | null;
   reasoningEffort: string;
   sandbox: AiChatSandbox;
   createdAt: string;
@@ -209,6 +222,10 @@ export interface Task {
   creatorAvatarUrl: string | null;
   assignee: ActorIdentity;
   workflowId: string | null;
+  repositoryProjectId: string | null;
+  rebaseBranch: string | null;
+  tomatoRepositories: TomatoRepositoryConfig[];
+  tomatoAnalysisDisabled: boolean;
   developmentContext: DevelopmentContext | null;
   dueDate: string | null;
   recurrence: Recurrence | null;
@@ -217,6 +234,15 @@ export interface Task {
   version: number;
   createdAt: string;
   updatedAt: string;
+  tomatoAnalysis: {
+    status: "fixable" | "needs_human" | "insufficient";
+    analyzedAt: string;
+    summary: string;
+    repairPlan: string;
+    decision: string | null;
+    missingInformation: string | null;
+    evidenceKey: string | null;
+  } | null;
 }
 
 export interface Comment {
@@ -263,6 +289,10 @@ export interface TaskDraft {
   labels: string[];
   assigneeTarget?: AssigneeTarget;
   workflowId: string | null;
+  repositoryProjectId?: string | null;
+  rebaseBranch?: string | null;
+  tomatoRepositories?: TomatoRepositoryConfig[];
+  tomatoAnalysisDisabled?: boolean;
   developmentContext: DevelopmentContext | null;
   dueDate: string | null;
   recurrence: Recurrence | null;

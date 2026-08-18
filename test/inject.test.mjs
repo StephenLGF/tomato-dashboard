@@ -1,10 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
-import vm from "node:vm";
-
-import { parseTaskboardAutomationHostRequest } from "../shared/taskboard-automation.mjs";
-
 const sourceUrl = new URL("../inject/codex-taskboard.user.js", import.meta.url);
 const source = await readFile(sourceUrl, "utf8");
 const webStyles = await readFile(new URL("../web/src/styles.css", import.meta.url), "utf8");
@@ -54,6 +50,14 @@ test("opening Taskboard suppresses native selection and contextual header until 
   assert.match(source, /restoreNativeSelection\(\)/);
   assert.match(source, /function onDocumentClick[\s\S]*closeTaskboard\(false\);/);
   assert.doesNotMatch(source, /setTimeout\(\(\) => closeTaskboard\(false\), 0\)/);
+});
+
+test("page mounting follows the stable Codex main-frame attribute", () => {
+  assert.match(
+    source,
+    /\[data-app-shell-thread-edge-divider\], \.app-shell-main-content-frame/,
+  );
+  assert.match(source, /rect\.top >= viewportRect\.top - 1/);
 });
 
 test("the embedded header fills the native titlebar without clipping or a full-page no-drag region", () => {
@@ -156,67 +160,6 @@ test("iframe messages require both the exact origin and source window", () => {
   assert.match(source, /postMessage\(message, frameOrigin\)/);
 });
 
-test("the iframe automation contract is forwarded through the fixed host binding", () => {
-  assert.match(source, /message\.type === "taskboard:automation-request"/);
-  assert.match(source, /function handleAutomationRequest\(payload\)/);
-  assert.match(source, /requestHost\(\s*"automation",\s*buildAutomationHostPayload\(payload\),\s*\)/);
-  assert.match(source, /operation: payload\.operation/);
-  assert.match(source, /taskboardProjectId: payload\.taskboardProjectId/);
-  assert.match(source, /codexProjectId: payload\.codexProjectId/);
-  assert.match(source, /workspacePath: payload\.workspacePath/);
-  assert.match(source, /skillPath: payload\.skillPath/);
-  assert.match(source, /model: payload\.model/);
-  assert.match(source, /reasoningEffort: payload\.reasoningEffort/);
-  assert.match(source, /type: "taskboard:automation-response"/);
-  assert.match(source, /requestId,\s*ok: true,\s*item: response\.item/);
-  assert.match(source, /items: response\.items/);
-  assert.match(source, /requestId,\s*ok: false,\s*error:/);
-  assert.match(source, /binding\(JSON\.stringify\(\{ \.\.\.payload, id, action \}\)\)/);
-});
-
-test("complete App automation payloads cross the injected forwarder into the current parser", () => {
-  const functionSource = source.slice(
-    source.indexOf("function buildAutomationHostPayload"),
-    source.indexOf("\n\n  async function handleAutomationRequest"),
-  );
-  assert.ok(functionSource.startsWith("function buildAutomationHostPayload"));
-  const buildAutomationHostPayload = vm.runInNewContext(`(${functionSource})`);
-  const basePayload = {
-    requestId: "request-1",
-    taskboardProjectId: "local",
-    codexProjectId: "codex-project",
-    projectName: "Local",
-    workspacePath: "/tmp/local-project",
-    skillPath: "/tmp/manage-taskboard/SKILL.md",
-    automationId: "automation-1",
-    intervalMinutes: 10,
-    model: "gpt-5.6-sol",
-    reasoningEffort: "ultra",
-  };
-
-  for (const operation of ["list", "pause", "ensure-active"]) {
-    const forwarded = {
-      id: `host-${operation}`,
-      action: "automation",
-      ...buildAutomationHostPayload({ ...basePayload, operation }),
-    };
-    assert.deepEqual(
-      parseTaskboardAutomationHostRequest(forwarded),
-      forwarded,
-      `${operation} must retain model and reasoningEffort`,
-    );
-  }
-});
-
-test("only a loopback Taskboard iframe can request native automation", () => {
-  assert.match(source, /function isLocalTaskboardOrigin\(origin\)/);
-  assert.match(source, /hostname === "127\.0\.0\.1" \|\| hostname === "localhost"/);
-  assert.match(
-    source,
-    /if \(!isLocalTaskboardOrigin\(frameOrigin\)\) \{\s*postToFrame\(\{\s*type: "taskboard:automation-response"/,
-  );
-});
-
 test("issues open an unsent native Codex composer in the exact workspace with a Skill mention", () => {
   assert.match(source, /function createThreadForTask\(payload\)/);
   assert.match(source, /\[data-app-action-sidebar-select-project\]/);
@@ -236,18 +179,18 @@ test("issues open an unsent native Codex composer in the exact workspace with a 
   assert.doesNotMatch(webApp, /taskboard:thread-created/);
   assert.match(
     webApp,
-    /const instruction = `e-taskboard Addressing the issues mentioned in \$\{task\.identifier\}`/,
+    /const instruction = `Work on the Tomato issue \$\{task\.identifier\}: \$\{task\.title\}`/,
   );
   assert.match(
     webApp,
-    /const prompt = `\[\$manage-taskboard\]\(\$\{manageTaskboardSkillPath\}\) \$\{instruction\}`/,
+    /const prompt = `\[\$tomato-workboard\]\(\$\{tomatoWorkboardSkillPath\}\) \$\{instruction\}`/,
   );
-  assert.match(webApp, /skillName: "manage-taskboard"/);
-  assert.match(webApp, /skillDisplayName: "Manage Taskboard"/);
-  assert.match(webApp, /skillPath: manageTaskboardSkillPath/);
+  assert.match(webApp, /skillName: "tomato-workboard"/);
+  assert.match(webApp, /skillDisplayName: "Tomato Workboard"/);
+  assert.match(webApp, /skillPath: tomatoWorkboardSkillPath/);
   assert.match(webApp, /instruction,/);
   assert.match(webApp, /type: "taskboard:create-thread"/);
-  assert.match(webApp, /type: "taskboard:open-thread", payload: \{ threadId \}/);
+  assert.match(webApp, /type: "taskboard:open-thread"/);
 });
 
 test("the standalone web page opens linked Codex tasks through the app deep link", () => {
@@ -260,6 +203,8 @@ test("the injected app opens an existing local Codex task instead of a new compo
     source.indexOf("function projectRowById"),
   );
   assert.match(openThreadSource, /if \(row\?\.isConnected\) \{\s*row\.click\?\.\(\);\s*return;/);
+  assert.match(openThreadSource, /type: "set-thread-title"/);
+  assert.match(openThreadSource, /conversationId: normalizedThreadId/);
   assert.match(openThreadSource, /await dispatchHostMessage\(\{\s*type: "navigate-to-route",\s*path: routeForThread\(normalizedThreadId\)/);
   assert.match(source, /return `\/local\/\$\{encodeURIComponent\(threadId\)\}`/);
   assert.doesNotMatch(source, /return `\/thread\/\$\{encodeURIComponent\(threadId\)\}`/);
@@ -269,6 +214,7 @@ test("the injected app opens an existing local Codex task instead of a new compo
 test("host navigation follows Codex's renderer message bus", () => {
   assert.match(source, /function dispatchHostMessage\(message\)/);
   assert.match(source, /window\.postMessage\(message, window\.location\.origin\)/);
+  assert.match(source, /const mounted = mountActivePage\(\);\s*if \(!mounted\) \{\s*void dispatchHostMessage\(\{\s*type: "navigate-to-route",\s*path: "\/"/);
   assert.doesNotMatch(source, /new CustomEvent\("codex-message-from-view"/);
 });
 

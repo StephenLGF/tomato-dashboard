@@ -420,7 +420,7 @@ function LocalRealtimeSync({
   return null;
 }
 
-function TaskboardApp() {
+function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
   const query = useMemo(() => new URLSearchParams(window.location.search), []);
   const embedded = query.get("host") === "codex";
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
@@ -430,6 +430,13 @@ function TaskboardApp() {
   const [developmentScanLoading, setDevelopmentScanLoading] = useState(false);
   const [tomatoWorkboardSkillPath, setTomatoWorkboardSkillPath] = useState("");
   const [taskboardMetadata, setTaskboardMetadata] = useState<TaskboardMetadata | null>(null);
+  const tomatoConfig = useMemo(() => {
+    if (!taskboardMetadata?.tomato) return undefined;
+    return {
+      ...taskboardMetadata.tomato,
+      tenant: taskboardMetadata.tomato.tenant || tomatoTenant,
+    };
+  }, [taskboardMetadata?.tomato, tomatoTenant]);
   const [localAiChatAvailable, setLocalAiChatAvailable] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [codexRepositories, setCodexRepositories] = useState<CodexRepository[]>([]);
@@ -2437,7 +2444,7 @@ function TaskboardApp() {
         ) : detailTask && selectedProject && isTomatoBoard ? (
           <TomatoTaskDetail
             task={detailTask}
-            tomatoConfig={taskboardMetadata?.tomato}
+            tomatoConfig={tomatoConfig}
             onAgentTransition={async (itemKey, targetStatus) => (
               await tomatoAiChatRef.current?.startSkillAction({
                 skillId: "tomato-bug-transition",
@@ -2551,7 +2558,7 @@ function TaskboardApp() {
                 <TomatoStatusColumn
                   key={status}
                   status={status}
-                  tomatoConfig={taskboardMetadata?.tomato}
+                  tomatoConfig={tomatoConfig}
                   tasks={tomatoTasksByStatus.get(status) ?? []}
                   contextMenuTaskId={contextMenu?.taskId ?? null}
                   onEdit={openTaskDetail}
@@ -2755,5 +2762,5 @@ export function App() {
       />
     );
   }
-  return <TaskboardApp />;
+  return <TaskboardApp tomatoTenant={session.context.id} />;
 }

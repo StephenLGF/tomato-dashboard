@@ -1,5 +1,5 @@
 {
-  "name": "codex-taskboard",
+  "name": "tomato-dashboard",
   "version": "0.1.0",
   "description": "将番茄事项、开发仓库与 Codex 对话连接起来的本地工作台。",
   "license": "MIT",
@@ -42,5 +42,21 @@
   },
   "overrides": {
     "undici": "7.29.0"
-  }
+  },
+  "author": "StephenLGF",
+  "homepage": "https://github.com/StephenLGF/tomato-dashboard",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/StephenLGF/tomato-dashboard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/StephenLGF/tomato-dashboard/issues"
+  },
+  "keywords": [
+    "codex",
+    "tomato",
+    "gitee",
+    "taskboard",
+    "productivity"
+  ]
 }

@@ -1,5 +1,7 @@
 # 番茄工作台 for Codex
 
+GitHub：<https://github.com/StephenLGF/tomato-dashboard>
+
 本项目采用 [MIT License](LICENSE)。
 
 将番茄 Team 事项同步为本地看板，并嵌入 Codex 桌面应用。你可以从卡片详情选择开发仓库、创建或继续 Codex 对话，并将可见的对话内容同步回对应事项。
@@ -62,8 +64,8 @@ Code MCP 不是项目固定依赖。只有需要代码搜索或代码操作的 C
 ## 快速开始
 
 ```bash
-git clone <你的仓库地址>
-cd <repo-directory>
+git clone https://github.com/StephenLGF/tomato-dashboard.git
+cd tomato-dashboard
 npm install
 cp .env.example .env
 npm run build
@@ -168,7 +170,7 @@ npm run codex
 
 在卡片对话中发送第一条消息后，可打开对应的 Codex 原生任务。在 Codex 中继续工作后，返回番茄工作台即可同步新增对话。本地工作台只保存对话索引和可见事件副本，Codex 原生对话仍由 Codex 自己持久化。
 
-首页的“分析仓库顺序”会优先使用 Codex 当前保存的项目顺序（`project-order`）。你可以点击“上移”或“下移”调整顺序，调整结果保存在浏览器本地存储 `taskboard.analysisRepositoryOrder.v1` 中；下一轮 Bug 分析会按照这个顺序逐个取证，前一个仓库证据不足时才继续下一个。
+番茄工作台右上角的“仓库管理”按钮会打开仓库弹窗，显示 Codex 当前配置的本地仓库、分支和分析顺序。你可以点击“上移”或“下移”调整顺序，调整结果保存在浏览器本地存储 `taskboard.analysisRepositoryOrder.v1` 中；下一轮 Bug 分析会按照这个顺序逐个取证，前一个仓库证据不足时才继续下一个。
 
 ## 技术原理
 

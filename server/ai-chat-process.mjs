@@ -614,7 +614,7 @@ export function spawnCodexAppServerTurn({
   });
   child.once("spawn", () => {
     send("initialize", {
-      clientInfo: { name: "codex-taskboard", version: "0.1.0" },
+      clientInfo: { name: "tomato-dashboard", version: "0.1.0" },
       capabilities: { experimentalApi: true },
     }, 1);
   });

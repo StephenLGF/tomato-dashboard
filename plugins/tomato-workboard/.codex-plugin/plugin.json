@@ -3,16 +3,16 @@
   "version": "0.1.0+codex.20260811070221",
   "description": "Open and work with the local Tomato issue board in Codex.",
   "author": {
-    "name": "Local developer"
+    "name": "StephenLGF"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "\u756a\u8304\u5de5\u4f5c\u53f0",
-    "shortDescription": "\u5728 Codex \u4e2d\u6253\u5f00\u672c\u5730\u756a\u8304\u4e8b\u9879\u770b\u677f\u3002",
-    "longDescription": "\u67e5\u770b\u756a\u8304\u4e8b\u9879\u770b\u677f\uff0c\u5e76\u4ece\u4e8b\u9879\u8be6\u60c5\u7ee7\u7eed\u53d1\u8d77 Codex \u5de5\u4f5c\u3002",
-    "developerName": "Local developer",
+    "displayName": "番茄工作台",
+    "shortDescription": "在 Codex 中打开本地番茄事项看板。",
+    "longDescription": "查看番茄事项看板，并从事项详情继续发起 Codex 工作。",
+    "developerName": "StephenLGF",
     "category": "Productivity",
     "capabilities": [],
-    "defaultPrompt": "\u6253\u5f00\u756a\u8304\u5de5\u4f5c\u53f0\u5e76\u67e5\u770b\u6211\u5f53\u524d\u7684\u4e8b\u9879\u3002"
+    "defaultPrompt": "打开番茄工作台并查看我当前的事项。"
   }
 }

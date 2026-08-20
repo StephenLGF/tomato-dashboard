@@ -176,12 +176,12 @@ export async function loadDeviceWorkspaces(codexStatePath, database, fallbackWor
 }
 
 export async function resolveAiWorkspace(projectId, codexStatePath, database, fallbackWorkspacePath = null) {
-  const project = await database.getProject(projectId);
-  if (!project) {
-    throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
-  }
   const workspaces = await loadDeviceWorkspaces(codexStatePath, database, fallbackWorkspacePath);
-  const workspacePath = workspaces.get(projectId);
+  let workspacePath = workspaces.get(projectId);
+  if (!workspacePath && projectId.startsWith("claude:")) {
+    workspacePath = await existingDirectory(projectId.slice("claude:".length));
+    if (workspacePath) workspaces.set(projectId, workspacePath);
+  }
   if (!workspacePath) {
     throw new ApiError(
       409,
@@ -189,6 +189,11 @@ export async function resolveAiWorkspace(projectId, codexStatePath, database, fa
       `Project '${projectId}' has no available device workspace`,
     );
   }
+  const project = await database.getProject(projectId) ?? {
+    id: projectId,
+    name: path.basename(workspacePath) || projectId,
+    workspacePath,
+  };
   return {
     workspacePath,
     addDirectories: [...new Set(workspaces.values())].filter((candidate) => candidate !== workspacePath),

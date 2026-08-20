@@ -10,7 +10,6 @@ interface TomatoStatusColumnProps {
   tasks: Task[];
   contextMenuTaskId: string | null;
   onEdit: (task: Task) => void;
-  onCopyLink: (url: string) => void;
   conversationByItemKey: ReadonlyMap<string, AiChatThread[]>;
   onToggleAnalysis: (task: Task) => void;
 }
@@ -46,7 +45,6 @@ export function TomatoStatusColumn({
   tasks,
   contextMenuTaskId,
   onEdit,
-  onCopyLink,
   conversationByItemKey,
   onToggleAnalysis,
 }: TomatoStatusColumnProps) {
@@ -83,7 +81,6 @@ export function TomatoStatusColumn({
             onOpenThread={() => onEdit(task)}
             onToggleTomatoAnalysis={onToggleAnalysis}
             externalUrl={tomatoItemUrl(itemKey, tomatoConfig)}
-            onExternalLinkFallback={onCopyLink}
             displayIdentifier={itemKey || task.identifier}
             displayTitle={task.title.replace(/^\[[^\]]+\]\s*/, "")}
             hideAssignee

@@ -1,20 +1,35 @@
-# 番茄工作台 for Codex
+# 番茄工作台
 
 GitHub：<https://github.com/StephenLGF/tomato-dashboard>
 
 本项目采用 [MIT License](LICENSE)。
 
-将番茄 Team 事项同步为本地看板，并嵌入 Codex 桌面应用。你可以从卡片详情选择开发仓库、创建或继续 Codex 对话，并将可见的对话内容同步回对应事项。
+当前版本：**v0.2.0**
+
+将番茄 Team 事项同步为本地看板，并通过浏览器使用 Codex 或 Claude Code 处理卡片。你可以从卡片详情选择开发仓库、创建或继续 Agent 对话，并将可见的对话内容同步回对应事项。
 
 > 当前版本主要面向 macOS。Codex 侧栏通过 Chrome DevTools Protocol（CDP）注入，不是官方公开插件 API；Codex 桌面应用升级后可能需要同步适配。
+
+## v0.2.0 版本说明
+
+这是一次工作台 UI 和多 Agent 能力改造：
+
+- 使用 Ant Design 重构页面布局、卡片、导航和加载状态，简约与科技主题只保留颜色差异；
+- 页面操作成功反馈统一使用 Ant Design Message；
+- 首页、CLI 登录、Agent 检查、仓库管理和卡片详情使用独立页面路由，页面切换不再触发整页刷新；
+- 卡片详情以多会话对话框为主体，支持新建、切换、右键删除会话以及打开原生 Agent 会话；
+- 新增 Claude Code 支持，可检查本地 CLI、读取 Claude 仓库并在卡片中创建或恢复 Claude 会话；
+- Codex 与 Claude 会话在左侧对话栏中使用独立标识。
+
+Claude 集成仅支持 Claude Code CLI，不支持使用 Claude Desktop 代替 CLI，具体限制见下方“Claude Code：仅支持 CLI”。
 
 ## 功能
 
 - 按番茄状态展示事项看板
 - 通过本机 `gitee` CLI 拉取事项并执行状态流转
 - 在卡片详情选择实际开发仓库
-- 在卡片内创建、恢复和继续 Codex 对话
-- 将 Codex 原生对话中的用户消息和助手回复同步回事项
+- 在卡片内创建、恢复和继续 Codex 或 Claude Code 对话
+- 将 Agent 对话中的用户消息和助手回复同步回事项
 - 使用本地 SQLite 持久化卡片、仓库选择、评论、附件和对话索引
 - 右上角提供“重载”按钮，强制重新加载页面
 
@@ -53,12 +68,19 @@ Tomato MCP 不是本项目同步和状态流转的必需依赖。如果你希望
 
 Code MCP 不是项目固定依赖。只有需要代码搜索或代码操作的 Codex 工作流才需要配置，配置应放在使用者自己的 Codex 配置中，不要放进本仓库。
 
+### Claude Code：仅支持 CLI
+
+番茄工作台通过本机 **Claude Code CLI** 创建、执行和恢复 Claude 会话，需要确保 `claude` 命令已经安装、登录并可从当前用户的 `PATH` 中找到。Claude CLI 不在 `PATH` 时，可以通过环境变量 `CLAUDE_EXECUTABLE` 指定可执行文件的绝对路径。
+
+当前不支持使用 Claude Desktop 代替 Claude Code CLI。Claude Desktop 的 `claude://code/new` 链接只能新建 Claude Code 会话，不能根据 CLI session ID 接续工作台中的已有会话；为了保证同一条会话能够持续执行和恢复，工作台始终使用 CLI。点击 Claude 会话的原生 Link 时，也会在终端中通过 CLI 恢复对应会话。
+
 ## 环境要求
 
 - macOS
 - Node.js 22.5 或更高版本
 - Codex 桌面应用（使用 `npm run codex` 时）
 - 已登录 Codex（使用嵌入式 Codex 对话时）
+- 已安装并登录 Claude Code CLI（使用 Claude 会话时；不支持 Claude Desktop）
 - 已安装并登录番茄 `gitee` CLI（使用番茄看板时）
 
 ## 快速开始

@@ -743,6 +743,23 @@
     throw new Error("Codex 对话输入框没有生成 tomato-workboard Skill 引用");
   }
 
+  function currentNativeThreadIds() {
+    const rowThreadId = activeThreadRow()?.getAttribute("data-app-action-sidebar-thread-id");
+    return [threadIdFromLocation(), rowThreadId]
+      .map(normalizeThreadId)
+      .filter(Boolean);
+  }
+
+  async function waitForCreatedThread(previousThreadId) {
+    const deadline = Date.now() + 120_000;
+    while (Date.now() < deadline) {
+      const candidate = currentNativeThreadIds().find((threadId) => threadId !== previousThreadId);
+      if (candidate) return candidate;
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    }
+    throw new Error("Codex 对话尚未创建，请先发送首条消息后重试");
+  }
+
   async function createThreadForTask(payload) {
     const taskId = typeof payload?.taskId === "string" ? payload.taskId.trim() : "";
     const identifier = typeof payload?.identifier === "string" ? payload.identifier.trim() : "";
@@ -765,6 +782,7 @@
       || pendingThreadCreation
     ) return;
     pendingThreadCreation = taskId;
+    const previousThreadId = currentNativeThreadIds()[0] || currentNativeThreadIds()[1] || "";
     try {
       const bridge = window.electronBridge;
       if (!bridge || typeof bridge.sendMessageFromView !== "function") {
@@ -811,6 +829,9 @@
       });
       await waitForPreparedComposer(identifier, skillPath);
       postToFrame({ type: "taskboard:thread-prepared", payload: { taskId } });
+      const threadId = await waitForCreatedThread(previousThreadId);
+      lastNativeThreadId = threadId;
+      postToFrame({ type: "taskboard:thread-created", payload: { taskId, threadId } });
     } catch (error) {
       postToFrame({
         type: "taskboard:thread-create-error",

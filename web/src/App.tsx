@@ -11,6 +11,8 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react";
+import { FolderOpenOutlined, HomeOutlined, MoonOutlined, RobotOutlined, SunOutlined } from "@ant-design/icons";
+import { ConfigProvider, Layout, Menu, Switch, Typography, message as antdMessage, theme as antdTheme } from "antd";
 // @ts-expect-error Shared runtime constants are verified by focused node tests.
 import { isVisibleTomatoStatus } from "../../shared/tomato-statuses.mjs";
 // @ts-expect-error Shared Tomato identity parsing is verified by focused node tests.
@@ -68,9 +70,19 @@ import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
 import { TaskEditor } from "./components/TaskEditor";
 import { TaskFilterMenu } from "./components/TaskFilterMenu";
-import { buildIssueUrl, readIssueIdentifier } from "./issueRoute";
+import {
+  buildCardUrl,
+  buildCardConversationUrl,
+  buildHomeUrl,
+  buildLoginUrl,
+  readCardIdentifier,
+  readConversationIdentifier,
+} from "./issueRoute";
 import { TomatoTaskDetail } from "./components/TomatoTaskDetail";
 import { TomatoLoginPage } from "./components/TomatoLoginPage";
+import { AgentSettingsPage } from "./components/AgentSettingsPage";
+import { RepositoryManagementPage } from "./components/RepositoryManagementPage";
+import { TopLoadingBar } from "./components/TopLoadingBar";
 import { DEFAULT_LABELS } from "./labels";
 import {
   EMPTY_TASK_FILTERS,
@@ -216,7 +228,7 @@ function getInitialTheme(): Theme {
   if (isTheme(fromQuery)) return fromQuery;
   const stored = window.localStorage.getItem("taskboard.theme");
   if (isTheme(stored)) return stored;
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  return "dark";
 }
 
 function readFavoriteProjectIds(): Set<string> {
@@ -420,11 +432,18 @@ function LocalRealtimeSync({
   return null;
 }
 
-function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
+function TaskboardApp({
+  tomatoTenant,
+  theme,
+  setTheme,
+}: {
+  tomatoTenant: string;
+  theme: Theme;
+  setTheme: Dispatch<SetStateAction<Theme>>;
+}) {
   const query = useMemo(() => new URLSearchParams(window.location.search), []);
   const embedded = query.get("host") === "codex";
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
-  const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [hostContext, setHostContext] = useState<HostContext | null>(null);
   const [developmentScan, setDevelopmentScan] = useState<DevelopmentScan>({ workspacePath: null, contexts: [] });
   const [developmentScanLoading, setDevelopmentScanLoading] = useState(false);
@@ -475,7 +494,10 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
   );
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [detailTaskIdentifier, setDetailTaskIdentifier] = useState<string | null>(
-    () => readIssueIdentifier(window.location.search),
+    () => readCardIdentifier(window.location.pathname, window.location.search),
+  );
+  const [detailConversationIdentifier, setDetailConversationIdentifier] = useState<string | null>(
+    () => readConversationIdentifier(window.location.pathname),
   );
   const [commentsRevision, setCommentsRevision] = useState(0);
   const [attachmentsRevision, setAttachmentsRevision] = useState(0);
@@ -492,8 +514,7 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [favoriteProjectIds, setFavoriteProjectIds] = useState(readFavoriteProjectIds);
   const [deviceWorkspacePaths, setDeviceWorkspacePaths] = useState(readDeviceWorkspacePaths);
-  const [analysisRepositoryOrder, setAnalysisRepositoryOrder] = useState(readAnalysisRepositoryOrder);
-  const [analysisRepositoryDialogOpen, setAnalysisRepositoryDialogOpen] = useState(false);
+  const [analysisRepositoryOrder] = useState(readAnalysisRepositoryOrder);
   const [announcement, setAnnouncementValue] = useState("");
   const [undoNotice, setUndoNotice] = useState<UndoNotice | null>(null);
   const tasksRequestRef = useRef(0);
@@ -510,6 +531,7 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
   const setAnnouncement = useCallback((message: string) => {
     setUndoNotice(null);
     setAnnouncementValue(message);
+    void antdMessage.success({ content: message, key: "taskboard-success" });
   }, []);
 
   useEffect(() => {
@@ -596,7 +618,10 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
     };
   }, [detailTaskIdentifier, selectedProjectId]);
   const detailTask = detailTaskIdentifier
-    ? tasks.find((task) => task.identifier === detailTaskIdentifier) ?? null
+    ? tasks.find((task) => (
+      task.identifier === detailTaskIdentifier
+      || (task.projectId === "tomato" && tomatoItemKeyFromTask(task)?.toUpperCase() === detailTaskIdentifier)
+    )) ?? null
     : null;
   const detailTaskId = detailTask?.id ?? null;
   const contextMenuTask = contextMenu
@@ -650,9 +675,10 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
     [codexRepositories, hostContext?.projects],
   );
   const orderedCodexRepositories = useMemo(() => {
-    const rank = new Map(analysisRepositoryOrder.map((projectId, index) => [projectId, index]));
+    const rank = new Map(analysisRepositoryOrder.map((identifier, index) => [identifier, index]));
     return [...tomatoRepositoryOptions].sort((left, right) => (
-      (rank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.id) ?? Number.MAX_SAFE_INTEGER)
+      (rank.get(left.workspacePath) ?? rank.get(left.id) ?? Number.MAX_SAFE_INTEGER)
+      - (rank.get(right.workspacePath) ?? rank.get(right.id) ?? Number.MAX_SAFE_INTEGER)
     ));
   }, [analysisRepositoryOrder, tomatoRepositoryOptions]);
   const orderedAnalysisRepositories = useMemo(() => {
@@ -672,36 +698,43 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
   );
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
 
-  function openTaskDetail(task: Pick<Task, "identifier" | "projectId">) {
+  function openTaskDetail(task: Pick<Task, "identifier" | "projectId"> & Partial<Pick<Task, "title" | "description">>) {
+    const routeIssueId = task.projectId === "tomato"
+      ? tomatoItemKeyFromTask(task) ?? task.identifier
+      : task.identifier;
     closeContextMenu();
     setProjectMenuOpen(false);
-    setDetailTaskIdentifier(task.identifier);
-    const currentIssue = readIssueIdentifier(window.location.search);
-    const boardUrl = buildIssueUrl(window.location.href, null, null);
-    if (!currentIssue) {
+    setDetailTaskIdentifier(routeIssueId.toUpperCase());
+    setDetailConversationIdentifier(null);
+    const boardUrl = buildHomeUrl(window.location.href);
+    if (!readCardIdentifier(window.location.pathname, window.location.search)) {
       window.history.replaceState(window.history.state, "", boardUrl);
     }
-    const detailUrl = buildIssueUrl(
-      currentIssue ? window.location.href : boardUrl.href,
-      null,
-      task.identifier,
-    );
+    const detailUrl = buildCardUrl(boardUrl.href, routeIssueId);
     window.history.pushState(window.history.state, "", detailUrl);
   }
 
   function closeTaskDetail() {
     setDetailTaskIdentifier(null);
-    const url = buildIssueUrl(window.location.href, null, null);
+    setDetailConversationIdentifier(null);
+    const url = buildHomeUrl(window.location.href);
     window.history.replaceState(window.history.state, "", url);
   }
 
   useEffect(() => {
-    const initialUrl = buildIssueUrl(window.location.href, null, readIssueIdentifier(window.location.search));
+    const initialCardId = readCardIdentifier(window.location.pathname, window.location.search);
+    const initialConversationId = readConversationIdentifier(window.location.pathname);
+    const initialUrl = initialCardId
+      ? initialConversationId
+        ? buildCardConversationUrl(window.location.href, initialCardId, initialConversationId)
+        : buildCardUrl(window.location.href, initialCardId)
+      : buildHomeUrl(window.location.href);
     window.history.replaceState(window.history.state, "", initialUrl);
 
     function syncRouteFromLocation() {
       const url = new URL(window.location.href);
-      setDetailTaskIdentifier(readIssueIdentifier(url.search));
+      setDetailTaskIdentifier(readCardIdentifier(url.pathname, url.search));
+      setDetailConversationIdentifier(readConversationIdentifier(url.pathname));
     }
 
     window.addEventListener("popstate", syncRouteFromLocation);
@@ -741,15 +774,6 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
   }, [projectMenuOpen]);
 
   useEffect(() => {
-    if (!analysisRepositoryDialogOpen) return undefined;
-    function closeFromEscape(event: KeyboardEvent) {
-      if (event.key === "Escape") setAnalysisRepositoryDialogOpen(false);
-    }
-    window.addEventListener("keydown", closeFromEscape);
-    return () => window.removeEventListener("keydown", closeFromEscape);
-  }, [analysisRepositoryDialogOpen]);
-
-  useEffect(() => {
     if (!embedded || window.parent === window) return;
 
     function receiveHostMessage(event: MessageEvent) {
@@ -763,6 +787,23 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
 
       if (message.type === "taskboard:thread-prepared") {
         setOpeningThreadTaskId(null);
+        return;
+      }
+
+      if (message.type === "taskboard:thread-created" && message.payload) {
+        const payload = message.payload as { taskId?: unknown; threadId?: unknown };
+        const taskId = typeof payload.taskId === "string" ? payload.taskId : "";
+        const threadId = typeof payload.threadId === "string" ? payload.threadId.trim() : "";
+        const task = tasksRef.current.find((candidate) => candidate.id === taskId);
+        if (!task || !threadId) return;
+        setOpeningThreadTaskId(null);
+        setActionError(null);
+        void updateTaskRequest(task, {}, threadId)
+          .then((saved) => {
+            setTasks((current) => current.map((candidate) => candidate.id === saved.id ? saved : candidate));
+            setAnnouncement(`已将 Codex 对话 ${threadId} 关联到 ${saved.identifier}`);
+          })
+          .catch((error) => setActionError(`Codex 对话已创建，但关联到卡片失败：${errorMessage(error)}`));
         return;
       }
 
@@ -1092,6 +1133,17 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
     setAnnouncementValue("");
     setUndoNotice(showNotice ? { id: operation.id, message } : null);
   }
+
+  const selectDetailConversation = useCallback((threadId: string | null) => {
+    if (!detailTaskIdentifier) return;
+    const currentThreadId = readConversationIdentifier(window.location.pathname);
+    if (currentThreadId === threadId) return;
+    const url = threadId
+      ? buildCardConversationUrl(window.location.href, detailTaskIdentifier, threadId)
+      : buildCardUrl(window.location.href, detailTaskIdentifier);
+    window.history.pushState(window.history.state, "", url);
+    setDetailConversationIdentifier(threadId);
+  }, [detailTaskIdentifier]);
 
   async function performUndo() {
     if (undoInFlightRef.current) return;
@@ -1690,12 +1742,21 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
       setActionError("任务面板还没有读取到 tomato-workboard Skill 路径，请刷新后重试。");
       return;
     }
+    const repositoryProjectId = task.repositoryProjectId ?? selectedProjectId;
+    const repositoryProject = projects.find((project) => project.id === repositoryProjectId) ?? null;
+    const repositoryCodexProjectId = repositoryProjectId === "local"
+      ? hostContext?.projectId
+      : repositoryProjectId;
+    const codexProject = hostContext?.projects?.find((project) => project.id === repositoryCodexProjectId);
     const worktreePath = task.developmentContext?.type === "worktree"
       ? task.developmentContext.path
       : null;
+    const configuredWorkspacePath = deviceWorkspacePaths[repositoryProjectId]
+      ?? repositoryProject?.workspacePath
+      ?? (repositoryProjectId === selectedProjectId ? developmentScan.workspacePath : null)
+      ?? (repositoryProjectId === selectedProjectId ? selectedDeviceWorkspacePath : null);
     const workspacePath = worktreePath
-      ?? selectedDeviceWorkspacePath
-      ?? developmentScan.workspacePath
+      ?? configuredWorkspacePath
       ?? hostContext?.workspacePath;
     const instruction = `Work on the Tomato issue ${task.identifier}: ${task.title}`;
     const prompt = `[$tomato-workboard](${tomatoWorkboardSkillPath}) ${instruction}`;
@@ -1708,7 +1769,6 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
       return;
     }
     if (openingThreadTaskId) return;
-    const codexProject = hostContext?.projects?.find((project) => project.id === selectedProject?.id);
     setOpeningThreadTaskId(task.id);
     setActionError(null);
     window.parent.postMessage({
@@ -1720,8 +1780,8 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
         skillName: "tomato-workboard",
         skillDisplayName: "Tomato Workboard",
         skillPath: tomatoWorkboardSkillPath,
-        codexProjectId: codexProject?.id ?? (selectedProject?.id === "local" ? hostContext?.projectId : selectedProject?.id),
-        projectName: selectedProject?.name,
+        codexProjectId: codexProject?.id ?? repositoryCodexProjectId,
+        projectName: codexProject?.name ?? repositoryProject?.name ?? selectedProject?.name,
         workspacePath,
         workspaceLabel: worktreePath ? workspaceName(worktreePath) : undefined,
       },
@@ -1740,7 +1800,7 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
     setActionError(null);
     undoStackRef.current = [];
     setUndoNotice(null);
-    const url = buildIssueUrl(window.location.href, projectId, null);
+    const url = buildHomeUrl(window.location.href);
     window.history.replaceState(null, "", url);
   }
 
@@ -1755,7 +1815,7 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
     setActionError(null);
     undoStackRef.current = [];
     setUndoNotice(null);
-    const url = buildIssueUrl(window.location.href, null, null);
+    const url = buildHomeUrl(window.location.href);
     window.history.replaceState(null, "", url);
     void loadProjectList();
   }
@@ -1771,17 +1831,6 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
       return next;
     });
     setAnnouncement(`${selectedProject?.name ?? "项目"}${shouldFavorite ? "已收藏。" : "已取消收藏。"}`);
-  }
-
-  function moveAnalysisRepository(projectId: string, direction: -1 | 1) {
-    const current = orderedCodexRepositories.map((repository) => repository.projectId);
-    const index = current.indexOf(projectId);
-    const nextIndex = index + direction;
-    if (index < 0 || nextIndex < 0 || nextIndex >= current.length) return;
-    [current[index], current[nextIndex]] = [current[nextIndex], current[index]];
-    setAnalysisRepositoryOrder(current);
-    window.localStorage.setItem(ANALYSIS_REPOSITORY_ORDER_KEY, JSON.stringify(current));
-    setAnnouncement("已更新分析仓库顺序，下一轮分析会按新顺序逐个排查。");
   }
 
   async function selectProject(choice: ProjectChoice) {
@@ -1895,42 +1944,6 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
     }
   }
 
-
-  function renderAnalysisRepositoryList() {
-    return (
-      <ol className="analysis-repository-order-list">
-        {orderedCodexRepositories.map((repository, index) => (
-          <li key={repository.projectId} className="analysis-repository-order-item">
-            <span className="analysis-repository-order-index">{index + 1}</span>
-            <span className="analysis-repository-order-copy">
-              <strong>{repository.name}</strong>
-              <span title={repository.workspacePath}>{repository.workspacePath}</span>
-              <small>{repository.currentBranch ? `当前分支：${repository.currentBranch}` : "未检测到当前分支"} · {repository.branches.length} 个本地分支</small>
-            </span>
-            <span className="analysis-repository-order-actions">
-              <button
-                type="button"
-                aria-label={`将 ${repository.name} 上移`}
-                disabled={index === 0}
-                onClick={() => moveAnalysisRepository(repository.projectId, -1)}
-              >
-                上移
-              </button>
-              <button
-                type="button"
-                aria-label={`将 ${repository.name} 下移`}
-                disabled={index === orderedCodexRepositories.length - 1}
-                onClick={() => moveAnalysisRepository(repository.projectId, 1)}
-              >
-                下移
-              </button>
-            </span>
-          </li>
-        ))}
-      </ol>
-    );
-  }
-
   const contextName = workspaceName(hostContext?.workspacePath);
   const headerProjectName = selectedProject?.name ?? "任务面板";
   const appShellStyle = embedded
@@ -2004,7 +2017,7 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
       )}
 
       <main className="workspace">
-        {selectedProjectId ? (
+        {selectedProjectId && !isTomatoBoard ? (
           <header className="workspace-header">
           <div className="workspace-title">
             <div className="workspace-kicker">
@@ -2130,19 +2143,6 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
             >
               重载
             </button>
-            {isTomatoBoard && !detailTask && (
-              <button
-                className="icon-button header-repository-button"
-                type="button"
-                aria-haspopup="dialog"
-                aria-expanded={analysisRepositoryDialogOpen}
-                aria-label="仓库管理"
-                title="管理番茄 Bug 分析仓库"
-                onClick={() => setAnalysisRepositoryDialogOpen(true)}
-              >
-                仓库管理
-              </button>
-            )}
             {selectedProjectId && !isTomatoBoard && boardView === "issues" && (
               <button
                 className="icon-button header-create-button"
@@ -2156,47 +2156,9 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
             )}
           </div>
           </header>
-        ) : (
+        ) : !selectedProjectId ? (
           <div ref={dragRegionRef} className="home-window-drag-region" aria-hidden="true" />
-        )}
-
-        {analysisRepositoryDialogOpen && isTomatoBoard && !detailTask && (
-          <div
-            className="analysis-repository-dialog-backdrop"
-            role="presentation"
-            onMouseDown={(event) => {
-              if (event.target === event.currentTarget) setAnalysisRepositoryDialogOpen(false);
-            }}
-          >
-            <section
-              className="analysis-repository-dialog"
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="analysis-repository-dialog-heading"
-              onMouseDown={(event) => event.stopPropagation()}
-            >
-              <header className="analysis-repository-dialog-heading">
-                <div>
-                  <span>番茄 Bug 分析</span>
-                  <h2 id="analysis-repository-dialog-heading">仓库管理</h2>
-                  <p>按这里的顺序依次取证；前一个仓库证据不足时才会继续检查下一个。</p>
-                </div>
-                <button
-                  type="button"
-                  className="icon-button"
-                  aria-label="关闭仓库管理"
-                  title="关闭"
-                  onClick={() => setAnalysisRepositoryDialogOpen(false)}
-                >
-                  <LinearIcon name="close" />
-                </button>
-              </header>
-              {orderedCodexRepositories.length > 0
-                ? renderAnalysisRepositoryList()
-                : <p className="analysis-repository-dialog-empty">暂未发现 Codex 本地仓库。</p>}
-            </section>
-          </div>
-        )}
+        ) : null}
 
         {selectedProjectId && !detailTask && <div className="board-toolbar">
           {!isTomatoBoard && <div className="view-tabs" aria-label="看板视图">
@@ -2444,6 +2406,7 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
         ) : detailTask && selectedProject && isTomatoBoard ? (
           <TomatoTaskDetail
             task={detailTask}
+            onBack={closeTaskDetail}
             tomatoConfig={tomatoConfig}
             onAgentTransition={async (itemKey, targetStatus) => (
               await tomatoAiChatRef.current?.startSkillAction({
@@ -2457,8 +2420,6 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
                 refreshProjectList(),
               ]);
             }}
-            onExternalLinkFallback={(url) => void copyText(url, "番茄链接已复制")}
-            onCopyLink={(url) => void copyText(url, "番茄链接已复制")}
             onError={setActionError}
             onAnnounce={setAnnouncement}
             repositoryOptions={tomatoRepositoryOptions}
@@ -2485,6 +2446,9 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
                 hideRepositoryPicker
                 inline
                 onOpenThread={openThread}
+                requestedThreadId={detailConversationIdentifier}
+                onSelectedThreadChange={selectDetailConversation}
+                headerTitle={detailTask.title.replace(/^\[[^\]]+\]\s*/, "")}
               />
             )}
           />
@@ -2562,7 +2526,6 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
                   tasks={tomatoTasksByStatus.get(status) ?? []}
                   contextMenuTaskId={contextMenu?.taskId ?? null}
                   onEdit={openTaskDetail}
-                  onCopyLink={(url) => void copyText(url, "番茄卡片链接已复制。")}
                   conversationByItemKey={tomatoConversationByItemKey}
                   onToggleAnalysis={(task) => void toggleTomatoAnalysis(task)}
                 />
@@ -2678,22 +2641,84 @@ function TaskboardApp({ tomatoTenant }: { tomatoTenant: string }) {
           </button>
         </div>
       )}
-      {announcement && (
-        <div className="toast" role="status" onAnimationEnd={() => setAnnouncementValue("")}>
-          <span aria-hidden="true"><LinearIcon name="check" /></span>{announcement}
-        </div>
-      )}
       {draggedTaskId && <div className="drag-hint" aria-hidden="true">拖到目标位置后松开</div>}
     </div>
   );
 }
 
+function WorkbenchLayout({
+  page,
+  theme,
+  setTheme,
+  onNavigate,
+  children,
+}: {
+  page: "home" | "agents" | "repositories";
+  theme: Theme;
+  setTheme: Dispatch<SetStateAction<Theme>>;
+  onNavigate: (pathname: string) => void;
+  children: ReactNode;
+}) {
+  return (
+    <Layout className="workbench-layout">
+      <Layout.Sider className="workbench-sider" width={208} breakpoint="lg" collapsedWidth={64}>
+        <div className="workbench-brand"><span>番</span><strong>番茄工作台</strong></div>
+        <Menu
+          mode="inline"
+          selectedKeys={[page]}
+          items={[
+            { key: "home", icon: <HomeOutlined />, label: "工作台" },
+            { key: "agents", icon: <RobotOutlined />, label: "Agent 检查" },
+            { key: "repositories", icon: <FolderOpenOutlined />, label: "仓库管理" },
+          ]}
+          onClick={({ key }) => onNavigate(key === "home" ? "/" : `/${key}`)}
+        />
+        <div className="workbench-theme-switch">
+          {theme === "dark" ? <MoonOutlined /> : <SunOutlined />}
+          <Typography.Text>{theme === "dark" ? "科技深色" : "简洁浅色"}</Typography.Text>
+          <Switch
+            size="small"
+            checked={theme === "dark"}
+            onChange={(checked) => setTheme(checked ? "dark" : "light")}
+          />
+        </div>
+      </Layout.Sider>
+      <Layout.Content className="workbench-content">{children}</Layout.Content>
+    </Layout>
+  );
+}
+
 
 export function App() {
+  const [pathname, setPathname] = useState(window.location.pathname);
+  const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [session, setSession] = useState<TomatoSession | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!["/agents", "/repositories"].includes(window.location.pathname));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const embedded = new URLSearchParams(window.location.search).get("host") === "codex";
+
+  const navigate = useCallback((destination: string | URL, replace = false) => {
+    const url = destination instanceof URL ? destination : new URL(destination, window.location.href);
+    const currentIsLocalPage = ["/agents", "/repositories"].includes(window.location.pathname);
+    const nextIsLocalPage = ["/agents", "/repositories"].includes(url.pathname);
+    if (currentIsLocalPage && !nextIsLocalPage) setLoading(true);
+    if (replace) window.history.replaceState(window.history.state, "", url);
+    else window.history.pushState(window.history.state, "", url);
+    setPathname(url.pathname);
+  }, []);
+
+  useEffect(() => {
+    const syncPathname = () => setPathname(window.location.pathname);
+    window.addEventListener("popstate", syncPathname);
+    return () => window.removeEventListener("popstate", syncPathname);
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    if (!embedded) window.localStorage.setItem("taskboard.theme", theme);
+  }, [embedded, theme]);
 
   const refreshSession = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -2710,6 +2735,10 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (["/agents", "/repositories"].includes(pathname)) {
+      setLoading(false);
+      return undefined;
+    }
     const controller = new AbortController();
     void refreshSession(controller.signal);
     const handleAuthRequired = () => {
@@ -2722,7 +2751,25 @@ export function App() {
       controller.abort();
       window.removeEventListener("tomato-auth-required", handleAuthRequired);
     };
-  }, [refreshSession]);
+  }, [pathname, refreshSession]);
+
+  useEffect(() => {
+    if (loading || ["/agents", "/repositories"].includes(pathname)) return;
+    const current = new URL(window.location.href);
+    if (session?.authenticated === true && session.context) return;
+    if (current.pathname === "/login") return;
+    const next = `${current.pathname}${current.search}`;
+    navigate(buildLoginUrl(current.href, next), true);
+  }, [loading, navigate, pathname, session]);
+
+  const leaveLoginPage = useCallback(() => {
+    const current = new URL(window.location.href);
+    const next = current.searchParams.get("next");
+    const destination = next && next.startsWith("/") && !next.startsWith("//")
+      ? new URL(next, current)
+      : buildHomeUrl(current.href);
+    navigate(destination, true);
+  }, [navigate]);
 
   const handleLogin = useCallback(async (token: string) => {
     setBusy(true);
@@ -2730,11 +2777,12 @@ export function App() {
       const nextSession = await loginTomato(token);
       setSession(nextSession);
       setError(null);
+      if (nextSession.context) leaveLoginPage();
       return nextSession;
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [leaveLoginPage]);
 
   const handleSwitchContext = useCallback(async (contextId: string) => {
     setBusy(true);
@@ -2742,17 +2790,39 @@ export function App() {
       const nextSession = await switchTomatoContext(contextId);
       setSession(nextSession);
       setError(null);
+      if (nextSession.context) leaveLoginPage();
       return nextSession;
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [leaveLoginPage]);
 
-  if (loading) {
-    return <main className="tomato-auth-shell"><div className="tomato-auth-loading">正在检查 Gitee CLI 登录状态…</div></main>;
-  }
-  if (session?.authenticated !== true || !session.context) {
-    return (
+  let content: ReactNode;
+  if (pathname === "/agents") {
+    content = (
+      <WorkbenchLayout page="agents" theme={theme} setTheme={setTheme} onNavigate={navigate}>
+        <AgentSettingsPage />
+      </WorkbenchLayout>
+    );
+  } else if (pathname === "/repositories") {
+    content = (
+      <WorkbenchLayout page="repositories" theme={theme} setTheme={setTheme} onNavigate={navigate}>
+        <RepositoryManagementPage />
+      </WorkbenchLayout>
+    );
+  } else if (loading) {
+    content = (
+      <WorkbenchLayout page="home" theme={theme} setTheme={setTheme} onNavigate={navigate}>
+        <TopLoadingBar label="正在检查 Gitee CLI 登录状态" />
+        <div className="route-loading-placeholder" />
+      </WorkbenchLayout>
+    );
+  } else if (
+    pathname === "/login"
+    || session?.authenticated !== true
+    || !session.context
+  ) {
+    content = (
       <TomatoLoginPage
         session={session}
         error={error}
@@ -2761,6 +2831,26 @@ export function App() {
         onSwitchContext={handleSwitchContext}
       />
     );
+  } else {
+    const taskboard = <TaskboardApp tomatoTenant={session.context.id} theme={theme} setTheme={setTheme} />;
+    content = embedded ? taskboard : (
+      <WorkbenchLayout page="home" theme={theme} setTheme={setTheme} onNavigate={navigate}>
+        {taskboard}
+      </WorkbenchLayout>
+    );
   }
-  return <TaskboardApp tomatoTenant={session.context.id} />;
+  return (
+    <ConfigProvider
+      theme={{
+        algorithm: theme === "dark" ? antdTheme.darkAlgorithm : antdTheme.defaultAlgorithm,
+        token: {
+          colorPrimary: theme === "dark" ? "#32d7e7" : "#5267d9",
+          borderRadius: 10,
+          colorBgBase: theme === "dark" ? "#081017" : "#f6f7fb",
+        },
+      }}
+    >
+      {content}
+    </ConfigProvider>
+  );
 }

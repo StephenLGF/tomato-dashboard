@@ -2176,8 +2176,8 @@ kbd {
 }
 
 .task-card.tomato-analysis-paused {
-  border-color: #8b929d;
-  background: color-mix(in srgb, #7d8591 12%, var(--surface-raised));
+  border-color: color-mix(in srgb, var(--text-secondary) 72%, var(--border));
+  background: color-mix(in srgb, var(--text-secondary) 16%, var(--surface-raised));
 }
 
 .task-card .tomato-analysis-toggle,
@@ -2211,9 +2211,10 @@ kbd {
 }
 
 .task-card .tomato-analysis-toggle.is-paused {
-  border-color: #69717d;
-  background: #69717d;
-  color: #fff;
+  border-color: var(--text-secondary);
+  background: color-mix(in srgb, var(--text-secondary) 42%, var(--surface-raised));
+  color: var(--text-primary);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--text-secondary) 20%, transparent);
 }
 
 .task-card .tomato-analysis-toggle svg {
@@ -2669,7 +2670,7 @@ kbd {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   background: var(--bg);
   -webkit-user-select: text;
   user-select: text;
@@ -2683,16 +2684,22 @@ kbd {
 
 .tomato-detail-content {
   display: grid;
-  grid-template-columns: minmax(0, 760px) minmax(190px, 240px);
+  grid-template-columns: minmax(0, 1fr) 248px;
   align-items: start;
-  width: min(1080px, 100%);
-  gap: 48px;
+  box-sizing: border-box;
+  height: 100%;
+  min-height: 0;
+  gap: 16px;
+  width: min(1440px, 100%);
   margin: 0 auto;
-  padding: 34px 28px 80px;
+  padding: 12px 16px 28px;
 }
 
 .tomato-detail-main {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 
 .tomato-detail-key {
@@ -2708,11 +2715,14 @@ kbd {
   justify-content: space-between;
   min-height: 28px;
   gap: 16px;
+  margin-bottom: 10px;
 }
 
 .tomato-detail-heading-actions {
   display: inline-flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -2753,9 +2763,9 @@ kbd {
 }
 
 .tomato-detail h1 {
-  margin: 8px 0 22px;
+  margin: 4px 0 10px;
   color: var(--text-primary);
-  font-size: 22px;
+  font-size: 18px;
   font-weight: 620;
   letter-spacing: -.02em;
   line-height: 1.45;
@@ -2765,7 +2775,7 @@ kbd {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin: -8px 0 22px;
+  margin: 10px 0 12px;
 }
 
 .tomato-transition-button {
@@ -2843,14 +2853,19 @@ kbd {
 
 .tomato-detail-sidebar {
   position: sticky;
-  top: 24px;
+  top: 12px;
+  margin-top: 38px;
+  max-height: calc(100vh - 62px);
+  padding: 10px;
   min-width: 0;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: auto;
 }
 
 .tomato-detail-sidebar > h2 {
-  height: 34px;
-  margin: 0;
-  padding: 5px 7px;
+  margin: 0 0 6px;
   color: var(--text-secondary);
   font-size: 12px;
   font-weight: 600;
@@ -3014,13 +3029,19 @@ kbd {
   border-top: var(--border-hairline) solid var(--border);
 }
 
-.tomato-detail-more > h2 {
+.tomato-detail-more > summary {
   height: auto;
   margin: 0 0 4px;
   padding: 5px 7px;
+  cursor: pointer;
+  list-style: none;
   color: var(--text-secondary);
   font-size: 11px;
   font-weight: 600;
+}
+
+.tomato-detail-more > summary::-webkit-details-marker {
+  display: none;
 }
 
 .tomato-detail-more .tomato-detail-metadata > div {
@@ -3029,21 +3050,47 @@ kbd {
 }
 
 .tomato-detail-conversations {
+  order: 1;
   margin-top: 0;
 }
 
-.tomato-detail-conversations > header {
+.tomato-detail-analysis,
+.tomato-repository-setup {
+  order: 2;
+}
+
+.tomato-detail-conversations .ai-chat-panel.is-inline {
+  height: calc(100vh - 84px);
+  min-height: 0;
+}
+
+.tomato-detail-heading-identity {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 10px;
 }
 
-.tomato-detail-conversations h2 {
-  margin: 0;
+.tomato-detail-back {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+}
+
+.tomato-detail-back:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
   color: var(--text-primary);
-  font-size: 13px;
-  font-weight: 600;
+}
+
+.tomato-detail-back svg {
+  width: 15px;
+  height: 15px;
 }
 
 .task-card .branch-chip {
@@ -3063,9 +3110,9 @@ kbd {
 @media (max-width: 720px) {
   .tomato-detail-content {
     grid-template-columns: minmax(0, 1fr) 180px;
-    gap: 20px;
-    padding-right: 20px;
-    padding-left: 20px;
+    gap: 12px;
+    padding-right: 12px;
+    padding-left: 12px;
   }
 }
 
@@ -3082,6 +3129,12 @@ kbd {
 
   .tomato-detail-sidebar {
     position: static;
+    margin-top: 12px;
+  }
+
+  .tomato-detail-conversations .ai-chat-panel.is-inline {
+    height: calc(100vh - 150px);
+    min-height: 460px;
   }
 }
 
@@ -7500,6 +7553,74 @@ kbd {
   background: var(--surface-raised);
 }
 
+.ai-chat-root.has-thread-list .ai-chat-panel.is-inline {
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+}
+
+.ai-chat-root.has-thread-list .ai-chat-panel-header {
+  grid-column: 1 / -1;
+}
+
+.ai-chat-root.has-thread-list .ai-chat-history.is-persistent {
+  position: static;
+  z-index: auto;
+  grid-row: 2 / -1;
+  grid-column: 1;
+  min-height: 0;
+  border-right: var(--border-hairline) solid var(--border);
+  background: var(--surface-muted);
+}
+
+.ai-chat-root.has-thread-list .ai-chat-messages,
+.ai-chat-root.has-thread-list .ai-chat-error,
+.ai-chat-root.has-thread-list .ai-chat-composer {
+  grid-column: 2;
+}
+
+.ai-chat-root.has-thread-list .ai-chat-messages {
+  grid-row: 2;
+}
+
+.ai-chat-root.has-thread-list .ai-chat-error {
+  grid-row: 3;
+}
+
+.ai-chat-root.has-thread-list .ai-chat-composer {
+  grid-row: 4;
+}
+
+@media (max-width: 760px) {
+  .ai-chat-root.has-thread-list .ai-chat-panel.is-inline {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  }
+
+  .ai-chat-root.has-thread-list .ai-chat-history.is-persistent {
+    grid-row: 2;
+    grid-column: 1;
+    max-height: 176px;
+    border-right: 0;
+    border-bottom: var(--border-hairline) solid var(--border);
+  }
+
+  .ai-chat-root.has-thread-list .ai-chat-messages {
+    grid-row: 3;
+    grid-column: 1;
+  }
+
+  .ai-chat-root.has-thread-list .ai-chat-error {
+    grid-row: 4;
+    grid-column: 1;
+  }
+
+  .ai-chat-root.has-thread-list .ai-chat-composer {
+    grid-row: 5;
+    grid-column: 1;
+  }
+}
+
 .ai-chat-history-heading {
   display: flex;
   align-items: center;
@@ -7509,6 +7630,35 @@ kbd {
   color: var(--text-tertiary);
 }
 
+.ai-chat-history-heading > div {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ai-chat-new-thread {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  gap: 5px;
+  padding: 0 8px;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.ai-chat-new-thread:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.ai-chat-new-thread svg {
+  width: 12px;
+  height: 12px;
+}
+
 .ai-chat-history-heading strong {
   color: var(--text-primary);
   font-size: 11px;
@@ -7516,10 +7666,13 @@ kbd {
 }
 
 .ai-chat-history-row {
+  position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 28px;
   align-items: center;
+  border: var(--border-hairline) solid transparent;
   border-radius: 8px;
+  overflow: hidden;
 }
 
 .ai-chat-history-row > button:first-child {
@@ -7541,10 +7694,59 @@ kbd {
   background: var(--surface-hover);
 }
 
+.ai-chat-history-row.is-active {
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--border));
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent), 0 0 0 1px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.ai-chat-history-row.is-active > button:first-child strong {
+  color: var(--accent);
+  font-weight: 650;
+}
+
+.ai-chat-history-row.is-active > button:first-child small {
+  color: var(--text-secondary);
+}
+
+.ai-chat-history-row.is-draft .ai-chat-thread-status {
+  border: 1px dashed var(--accent);
+  background: transparent;
+}
+
 .ai-chat-history-row > button:first-child > span:last-child {
   display: flex;
   flex-direction: column;
   min-width: 0;
+}
+
+.ai-chat-history-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ai-chat-history-title > strong {
+  min-width: 0;
+}
+
+.ai-chat-provider-badge {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 8px;
+  font-weight: 650;
+  line-height: 14px;
+}
+
+.ai-chat-provider-badge.is-claude-code {
+  border-color: color-mix(in srgb, #d97757 38%, var(--border));
+  background: color-mix(in srgb, #d97757 12%, transparent);
+  color: #d97757;
 }
 
 .ai-chat-history-row > button:first-child strong,
@@ -7564,7 +7766,7 @@ kbd {
   font-size: 9px;
 }
 
-.ai-chat-history-delete {
+.ai-chat-history-native-link {
   display: grid;
   place-items: center;
   width: 24px;
@@ -7577,17 +7779,47 @@ kbd {
   opacity: 0;
 }
 
-.ai-chat-history-row:hover .ai-chat-history-delete,
-.ai-chat-history-delete:focus-visible {
+.ai-chat-history-row:hover .ai-chat-history-native-link,
+.ai-chat-history-native-link:focus-visible,
+.ai-chat-history-row.is-active .ai-chat-history-native-link {
   opacity: 1;
 }
 
-.ai-chat-history-delete:hover:not(:disabled) {
-  background: var(--danger-soft);
-  color: var(--danger);
+.ai-chat-history-native-link:hover:not(:disabled) {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
-.ai-chat-history-delete svg {
+.ai-chat-thread-context-menu {
+  position: fixed;
+  z-index: 10000;
+  min-width: 132px;
+  padding: 5px;
+  border: var(--border-hairline) solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-elevated);
+  box-shadow: var(--shadow-lg);
+}
+
+.ai-chat-thread-context-menu button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--danger);
+  font-size: 11px;
+  text-align: left;
+}
+
+.ai-chat-thread-context-menu button:hover {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.ai-chat-history-native-link svg {
   width: 12px;
   height: 12px;
 }
@@ -8318,6 +8550,340 @@ kbd {
   align-items: center;
   min-height: 36px;
   gap: 5px;
+}
+
+.ai-chat-runtime-picker select {
+  height: 28px;
+  padding: 0 24px 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+}
+
+.ai-chat-runtime-picker select:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.agent-settings-page {
+  min-height: 100vh;
+  padding: 56px clamp(24px, 7vw, 96px);
+  background: var(--bg);
+  color: var(--text-primary);
+}
+
+.agent-settings-header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  max-width: 880px;
+  gap: 24px;
+  margin: 0 auto 36px;
+}
+
+.agent-settings-header > button,
+.agent-runtime-actions button {
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-raised);
+  color: var(--text-primary);
+}
+
+.agent-settings-header span {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.agent-settings-header h1 {
+  margin: 6px 0 8px;
+  font-size: clamp(28px, 4vw, 42px);
+}
+
+.agent-settings-header p,
+.agent-runtime-title p {
+  margin: 0;
+  color: var(--text-tertiary);
+}
+
+.agent-settings-error {
+  max-width: 880px;
+  margin: 0 auto 16px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  border-radius: 10px;
+  color: var(--danger);
+}
+
+.agent-runtime-list {
+  display: grid;
+  max-width: 880px;
+  gap: 16px;
+  margin: 0 auto;
+}
+
+.agent-runtime-card {
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface-raised);
+}
+
+.agent-runtime-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+
+.agent-runtime-title h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+
+.agent-runtime-status {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--text-quaternary);
+}
+
+.agent-runtime-status.is-ready { background: var(--success); }
+.agent-runtime-status.is-error { background: var(--danger); }
+
+.agent-runtime-card label {
+  display: grid;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.agent-runtime-card input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text-primary);
+  font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.agent-runtime-result {
+  display: grid;
+  gap: 3px;
+  margin-top: 14px;
+  padding: 11px 12px;
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.agent-runtime-result.is-ready strong { color: var(--success); }
+.agent-runtime-result.is-error strong { color: var(--danger); }
+
+.agent-runtime-result span {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.agent-runtime-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.agent-runtime-actions button.is-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: white;
+}
+
+.agent-runtime-actions button:disabled {
+  opacity: .45;
+}
+
+@media (max-width: 640px) {
+  .agent-settings-page { padding: 28px 16px; }
+  .agent-settings-header { grid-template-columns: 1fr; }
+  .agent-settings-header > button { justify-self: start; }
+  .agent-runtime-card { padding: 18px; }
+}
+
+.workbench-layout {
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+.workbench-sider.ant-layout-sider {
+  position: sticky;
+  top: 0;
+  z-index: 90;
+  height: 100vh;
+  border-right: 1px solid var(--border);
+  background: var(--surface-raised);
+}
+
+.workbench-sider .ant-layout-sider-children {
+  display: flex;
+  flex-direction: column;
+}
+
+.workbench-brand {
+  display: flex;
+  align-items: center;
+  height: 64px;
+  gap: 10px;
+  padding: 0 18px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.workbench-brand > span {
+  display: grid;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+
+.workbench-sider .ant-menu {
+  flex: 1;
+  border-inline-end: 0;
+  background: transparent;
+}
+
+.workbench-theme-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px;
+  padding: 10px;
+  border-radius: 10px;
+  background: var(--surface);
+  white-space: nowrap;
+}
+
+.workbench-theme-switch .ant-typography {
+  flex: 1;
+  overflow: hidden;
+  font-size: 12px;
+}
+
+.workbench-content {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.workbench-content > .app-shell {
+  min-height: 100vh;
+}
+
+.utility-page {
+  min-height: 100%;
+  padding: 40px;
+}
+
+.utility-page-heading {
+  margin-bottom: 24px;
+}
+
+.utility-page-heading h1.ant-typography {
+  margin: 0 0 8px;
+  font-size: 30px;
+  line-height: 1.25;
+}
+
+.utility-page-heading p.ant-typography {
+  margin: 0;
+}
+
+@media (max-width: 760px) {
+  .utility-page {
+    padding: 28px 16px;
+  }
+}
+
+.agent-check-page {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.agent-check-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.agent-check-card.ant-card {
+  min-height: 220px;
+  border-color: var(--border);
+}
+
+.agent-check-loading {
+  min-height: 220px;
+  padding-top: 32px;
+}
+
+.agent-check-success { color: var(--success); }
+.agent-check-error { color: var(--danger); }
+
+@media (max-width: 800px) {
+  .agent-check-grid { grid-template-columns: 1fr; }
+  .agent-check-page { padding: 28px 18px; }
+}
+
+.top-loading-bar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 1000;
+  height: 3px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  pointer-events: none;
+}
+
+.top-loading-bar > span {
+  display: block;
+  width: 38%;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, transparent, var(--accent), #75f5ff, transparent);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 70%, transparent);
+  animation: top-loading-progress 1.15s ease-in-out infinite;
+}
+
+.route-loading-placeholder {
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+@keyframes top-loading-progress {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(300%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .top-loading-bar > span {
+    width: 100%;
+    animation: none;
+  }
 }
 
 .ai-chat-composer-toolbar button:focus,
@@ -9054,7 +9620,7 @@ kbd {
   .card-actions,
   .comment-actions,
   .attachment-actions,
-  .ai-chat-history-delete {
+  .ai-chat-history-native-link {
     opacity: 1;
   }
 
@@ -9525,4 +10091,604 @@ kbd {
   .analysis-repository-dialog {
     max-height: calc(100vh - 32px);
   }
+}
+
+/* --------------------------------------------------------------------------
+   Neon operations console refresh
+   The tomato board keeps the existing interaction model, but gets a darker
+   telemetry-console treatment so status, movement, and sync controls read as
+   one coherent product surface.
+   -------------------------------------------------------------------------- */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #070c14;
+  --header-bg: #0a1320;
+  --sidebar-bg: #08111d;
+  --surface: #0f1b2a;
+  --surface-raised: #122237;
+  --surface-muted: #0c1725;
+  --surface-hover: #162b40;
+  --surface-active: #10324a;
+  --column-header: #0b1726;
+  --text-primary: #edf8ff;
+  --text-secondary: #9bb8ce;
+  --text-tertiary: #5e7d94;
+  --text-quaternary: #395366;
+  --border: rgba(91, 182, 226, 0.16);
+  --border-strong: rgba(111, 213, 255, 0.42);
+  --accent: #4de3ff;
+  --accent-hover: #a1f4ff;
+  --accent-soft: rgba(77, 227, 255, 0.14);
+  --danger: #ff668a;
+  --danger-soft: rgba(255, 102, 138, 0.14);
+  --warning: #ffd166;
+  --success: #5ff2ae;
+  --status-backlog: #5e7d94;
+  --status-todo: #4de3ff;
+  --status-progress: #ffd166;
+  --status-review: #5ff2ae;
+  --status-blocked: #ff668a;
+  --status-done: #b48cff;
+  --status-canceled: #7694a9;
+  --scrollbar-thumb: rgba(117, 210, 247, 0.22);
+  --scrollbar-thumb-hover: rgba(117, 210, 247, 0.56);
+  --card-shadow: 0 12px 28px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  --dialog-shadow: 0 30px 90px rgba(0, 0, 0, 0.62), 0 0 32px rgba(77, 227, 255, 0.08);
+}
+
+/*
+ * Theme variants share one layout. The legacy neon-console rules below also
+ * changed spacing and component dimensions, so keep them disabled and let the
+ * dark theme differ exclusively through the color variables above.
+ */
+@media (width < 0px) {
+:root[data-theme="dark"] body {
+  background: var(--bg);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board {
+  background:
+    radial-gradient(circle at 12% 6%, rgba(77, 227, 255, 0.08), transparent 28%),
+    radial-gradient(circle at 86% 0%, rgba(180, 140, 255, 0.08), transparent 25%),
+    var(--bg);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .workspace {
+  isolation: isolate;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(77, 227, 255, 0.055), transparent 34%),
+    linear-gradient(180deg, rgba(7, 12, 20, 0.86), rgba(7, 12, 20, 0.98));
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .workspace::before,
+:root[data-theme="dark"] .app-shell:not(.tomato-board) .workspace::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(77, 227, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(77, 227, 255, 0.035) 1px, transparent 1px);
+  background-size: 32px 32px;
+  content: "";
+  mask-image: linear-gradient(to bottom, black 0%, rgba(0, 0, 0, 0.68) 58%, transparent 100%);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .workspace-header {
+  position: relative;
+  flex-basis: 58px;
+  padding: 0 18px;
+  border-bottom: 1px solid rgba(77, 227, 255, 0.16);
+  background: rgba(8, 17, 29, 0.88);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(18px);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .workspace-header::before {
+  position: absolute;
+  top: 0;
+  left: 18px;
+  width: 112px;
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent), transparent);
+  box-shadow: 0 0 18px rgba(77, 227, 255, 0.65);
+  content: "";
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .workspace-header::after {
+  position: absolute;
+  right: 18px;
+  bottom: -1px;
+  left: 18px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(77, 227, 255, 0.34), transparent);
+  content: "";
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .workspace-title,
+:root[data-theme="dark"] .app-shell.tomato-board .workspace-kicker {
+  gap: 10px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .project-avatar {
+  width: 28px;
+  height: 28px;
+  border: 1px solid rgba(77, 227, 255, 0.5);
+  border-radius: 8px;
+  background: linear-gradient(145deg, rgba(77, 227, 255, 0.22), rgba(180, 140, 255, 0.18));
+  color: var(--accent-hover);
+  box-shadow: inset 0 0 18px rgba(77, 227, 255, 0.12), 0 0 16px rgba(77, 227, 255, 0.08);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .project-name {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 680;
+  letter-spacing: 0.08em;
+  text-shadow: 0 0 18px rgba(77, 227, 255, 0.25);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .header-actions {
+  gap: 6px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .header-actions button,
+:root[data-theme="dark"] .app-shell.tomato-board .header-actions .button {
+  min-height: 30px;
+  border: 1px solid rgba(91, 182, 226, 0.18);
+  border-radius: 7px;
+  background: rgba(15, 27, 42, 0.74);
+  color: var(--text-secondary);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .header-actions button:hover,
+:root[data-theme="dark"] .app-shell.tomato-board .header-actions .button:hover {
+  border-color: rgba(77, 227, 255, 0.55);
+  background: rgba(16, 48, 74, 0.9);
+  color: var(--accent-hover);
+  box-shadow: 0 0 18px rgba(77, 227, 255, 0.09);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .board-toolbar {
+  position: relative;
+  flex-basis: 62px;
+  gap: 14px;
+  padding: 0 18px;
+  border-bottom: 1px solid rgba(91, 182, 226, 0.14);
+  background: rgba(10, 19, 32, 0.76);
+  backdrop-filter: blur(16px);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .board-toolbar::before {
+  position: absolute;
+  top: 0;
+  left: 18px;
+  width: 7px;
+  height: 7px;
+  border-right: 1px solid var(--accent);
+  border-bottom: 1px solid var(--accent);
+  content: "";
+  transform: rotate(45deg) translateY(-4px);
+  opacity: 0.75;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .toolbar-tools {
+  gap: 9px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field,
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field:focus-within,
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field.has-value {
+  flex-basis: min(320px, 42vw);
+  width: min(320px, 42vw);
+  min-height: 34px;
+  border: 1px solid rgba(91, 182, 226, 0.26);
+  border-radius: 8px;
+  background: rgba(13, 29, 45, 0.9);
+  box-shadow: inset 0 0 0 1px rgba(77, 227, 255, 0.025), 0 0 0 rgba(77, 227, 255, 0);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field:focus-within,
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field.has-value {
+  border-color: rgba(77, 227, 255, 0.64);
+  box-shadow: 0 0 0 3px rgba(77, 227, 255, 0.08), 0 0 22px rgba(77, 227, 255, 0.08);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field input {
+  color: var(--text-primary);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field input::placeholder {
+  color: var(--text-tertiary);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .search-icon {
+  color: var(--accent);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field kbd {
+  border: 1px solid rgba(91, 182, 226, 0.28);
+  border-radius: 4px;
+  background: rgba(77, 227, 255, 0.06);
+  color: var(--text-tertiary);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-start-button,
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-sync-button {
+  width: 34px;
+  height: 34px;
+  border: 1px solid rgba(91, 182, 226, 0.24);
+  border-radius: 8px;
+  background: rgba(15, 27, 42, 0.88);
+  color: var(--text-secondary);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-start-button:hover,
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-sync-button:hover,
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-start-button.is-running {
+  border-color: rgba(77, 227, 255, 0.68);
+  background: rgba(16, 48, 74, 0.94);
+  color: var(--accent-hover);
+  box-shadow: 0 0 22px rgba(77, 227, 255, 0.12);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-start-button svg,
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-sync-button svg {
+  width: 16px;
+  height: 16px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .board-scroll {
+  padding: 16px 18px 18px;
+  background: transparent;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .board {
+  gap: 12px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .board-column {
+  position: relative;
+  flex-basis: clamp(286px, 23vw, 360px);
+  width: clamp(286px, 23vw, 360px);
+  overflow: hidden auto;
+  border: 1px solid rgba(91, 182, 226, 0.14);
+  border-radius: 12px;
+  background:
+    linear-gradient(180deg, rgba(13, 29, 45, 0.86), rgba(8, 17, 29, 0.92)),
+    var(--column-header);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035), 0 16px 28px rgba(0, 0, 0, 0.18);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .board-column::before {
+  position: absolute;
+  z-index: 5;
+  top: 0;
+  right: 12px;
+  left: 12px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(77, 227, 255, 0.42), transparent);
+  content: "";
+  pointer-events: none;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .board-column::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 86px;
+  background: linear-gradient(180deg, transparent, rgba(77, 227, 255, 0.03));
+  content: "";
+  pointer-events: none;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .board-column.is-drop-target {
+  border-color: rgba(77, 227, 255, 0.84);
+  background:
+    linear-gradient(180deg, rgba(16, 48, 74, 0.92), rgba(8, 17, 29, 0.96)),
+    var(--column-header);
+  box-shadow: 0 0 0 3px rgba(77, 227, 255, 0.09), 0 0 28px rgba(77, 227, 255, 0.16);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .column-header {
+  flex-basis: 56px;
+  height: 56px;
+  padding: 0 13px;
+  border-bottom: 1px solid rgba(91, 182, 226, 0.12);
+  background: rgba(11, 23, 38, 0.82);
+  backdrop-filter: blur(12px);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .column-heading {
+  gap: 8px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .column-heading h2 {
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 720;
+  letter-spacing: 0.12em;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .status-icon {
+  width: 16px;
+  height: 16px;
+  filter: drop-shadow(0 0 6px currentColor);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .status-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-count {
+  min-width: 22px;
+  height: 20px;
+  padding: 1px 6px 0;
+  border: 1px solid rgba(91, 182, 226, 0.18);
+  border-radius: 999px;
+  background: rgba(77, 227, 255, 0.06);
+  color: var(--accent);
+  font-size: 10px;
+  text-align: center;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .column-actions .icon-button {
+  width: 26px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--text-tertiary);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .column-actions .icon-button:hover,
+:root[data-theme="dark"] .app-shell.tomato-board .column-actions .icon-button:focus-visible {
+  border-color: rgba(77, 227, 255, 0.4);
+  background: rgba(77, 227, 255, 0.08);
+  color: var(--accent-hover);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .column-list {
+  position: relative;
+  z-index: 1;
+  gap: 10px;
+  padding: 12px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card {
+  min-height: 92px;
+  gap: 7px;
+  padding: 10px 11px 9px;
+  border: 1px solid rgba(91, 182, 226, 0.16);
+  border-radius: 9px;
+  background:
+    linear-gradient(135deg, rgba(18, 34, 55, 0.96), rgba(12, 24, 39, 0.96)),
+    var(--surface);
+  box-shadow: var(--card-shadow);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(77, 227, 255, 0.42), transparent);
+  content: "";
+  opacity: 0.52;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card:hover,
+:root[data-theme="dark"] .app-shell.tomato-board .task-card.is-context-open {
+  border-color: rgba(77, 227, 255, 0.68);
+  background:
+    linear-gradient(135deg, rgba(22, 53, 77, 0.98), rgba(15, 31, 50, 0.98)),
+    var(--surface-raised);
+  box-shadow: 0 0 0 2px rgba(77, 227, 255, 0.07), 0 0 24px rgba(77, 227, 255, 0.12), var(--card-shadow);
+  transform: translateY(-1px);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .card-reference > svg,
+:root[data-theme="dark"] .app-shell.tomato-board .task-identifier {
+  color: var(--accent);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .card-parent-title {
+  color: var(--text-tertiary);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card h3 {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 610;
+  line-height: 18px;
+  letter-spacing: 0.01em;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .card-properties {
+  height: 22px;
+  gap: 5px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .label-chip,
+:root[data-theme="dark"] .app-shell.tomato-board .creator-chip,
+:root[data-theme="dark"] .app-shell.tomato-board .branch-chip {
+  border-color: rgba(91, 182, 226, 0.18);
+  border-radius: 4px;
+  background: rgba(77, 227, 255, 0.045);
+  color: var(--text-secondary);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .thread-link {
+  border-color: rgba(180, 140, 255, 0.28);
+  background: rgba(180, 140, 255, 0.08);
+  color: #d4c2ff;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .thread-link:hover {
+  border-color: rgba(180, 140, 255, 0.64);
+  background: rgba(180, 140, 255, 0.16);
+  color: #eee6ff;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card .tomato-analysis-toggle,
+:root[data-theme="dark"] .app-shell.tomato-board .task-card .card-external-link {
+  top: 7px;
+  width: 24px;
+  height: 24px;
+  border-color: rgba(91, 182, 226, 0.26);
+  border-radius: 6px;
+  background: rgba(8, 17, 29, 0.92);
+  color: var(--text-secondary);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card .tomato-analysis-toggle {
+  right: 36px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card .card-external-link {
+  right: 8px;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card .tomato-analysis-toggle:hover,
+:root[data-theme="dark"] .app-shell.tomato-board .task-card .card-external-link:hover,
+:root[data-theme="dark"] .app-shell.tomato-board .task-card .card-external-link:focus-visible {
+  border-color: rgba(77, 227, 255, 0.65);
+  background: rgba(16, 48, 74, 0.94);
+  color: var(--accent-hover);
+  box-shadow: 0 0 12px rgba(77, 227, 255, 0.12);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card.tomato-analysis-fixable {
+  border-color: rgba(95, 242, 174, 0.5);
+  background: linear-gradient(135deg, rgba(17, 57, 50, 0.96), rgba(12, 31, 38, 0.96));
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card.tomato-analysis-needs_human {
+  border-color: rgba(255, 209, 102, 0.52);
+  background: linear-gradient(135deg, rgba(63, 53, 26, 0.94), rgba(35, 29, 22, 0.96));
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card.tomato-analysis-insufficient {
+  border-color: rgba(255, 102, 138, 0.54);
+  background: linear-gradient(135deg, rgba(62, 28, 43, 0.95), rgba(35, 22, 32, 0.96));
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .task-card.tomato-analysis-paused {
+  border-color: rgba(118, 148, 169, 0.38);
+  background: linear-gradient(135deg, rgba(28, 44, 58, 0.95), rgba(15, 27, 41, 0.96));
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-progress {
+  flex-basis: 38px;
+  padding-inline: 18px;
+  border-bottom: 1px solid rgba(77, 227, 255, 0.18);
+  background: rgba(12, 28, 44, 0.92);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-progress-copy {
+  color: var(--text-secondary);
+  letter-spacing: 0.03em;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-progress-copy span {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-progress-copy strong {
+  color: var(--text-primary);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-progress-track {
+  height: 2px;
+  background: rgba(77, 227, 255, 0.12);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-progress-track span {
+  background: linear-gradient(90deg, transparent, var(--accent), #b48cff, transparent);
+  box-shadow: 0 0 12px rgba(77, 227, 255, 0.7);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .error-banner,
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-process {
+  border-color: rgba(77, 227, 255, 0.22);
+  background: rgba(10, 23, 38, 0.96);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.44), 0 0 28px rgba(77, 227, 255, 0.07);
+  backdrop-filter: blur(20px);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-process > header {
+  border-bottom-color: rgba(91, 182, 226, 0.14);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-process > header span,
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-process-events article > span {
+  color: var(--accent);
+  letter-spacing: 0.05em;
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-process-events article {
+  border-bottom-color: rgba(91, 182, 226, 0.12);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .tomato-analysis-process-events article p {
+  color: var(--text-secondary);
+}
+
+:root[data-theme="dark"] .app-shell.tomato-board .project-home,
+:root[data-theme="dark"] .app-shell:not(.tomato-board) .project-home {
+  background: transparent;
+}
+
+@media (max-width: 760px) {
+  :root[data-theme="dark"] .app-shell.tomato-board .workspace-header {
+    padding-inline: 12px;
+  }
+
+  :root[data-theme="dark"] .app-shell.tomato-board .header-actions button {
+    min-width: 30px;
+    padding-inline: 7px;
+    font-size: 0;
+  }
+
+  :root[data-theme="dark"] .app-shell.tomato-board .header-actions button svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  :root[data-theme="dark"] .app-shell.tomato-board .project-name {
+    max-width: 38vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  :root[data-theme="dark"] .app-shell.tomato-board .board-toolbar {
+    padding-inline: 12px;
+  }
+
+  :root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field,
+  :root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field:focus-within,
+  :root[data-theme="dark"] .app-shell.tomato-board .tomato-search-field.has-value {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+  }
+
+  :root[data-theme="dark"] .app-shell.tomato-board .board-scroll {
+    padding: 12px;
+  }
+
+  :root[data-theme="dark"] .app-shell.tomato-board .board-column {
+    flex-basis: min(86vw, 340px);
+    width: min(86vw, 340px);
+  }
+}
 }

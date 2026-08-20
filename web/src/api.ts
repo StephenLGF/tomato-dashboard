@@ -3,9 +3,11 @@ import type {
   AiChatCatalog,
   AiChatAttachmentInput,
   AiChatRun,
+  AiChatProvider,
   AiChatSandbox,
   AiChatThread,
   AiChatThreadSnapshot,
+  AgentRuntimeConfig,
   Attachment,
   Comment,
   CodexRepository,
@@ -31,6 +33,11 @@ let currentUserActor = DEFAULT_USER_ACTOR;
 
 export function setCurrentUserActor(actor?: ActorIdentity) {
   currentUserActor = actor?.type === "user" ? actor : DEFAULT_USER_ACTOR;
+}
+
+export async function listAgentRuntimes(signal?: AbortSignal): Promise<AgentRuntimeConfig[]> {
+  const data = await request<{ runtimes: AgentRuntimeConfig[] }>("/api/agent-runtimes", { signal });
+  return data.runtimes;
 }
 
 interface ApiErrorBody {
@@ -110,10 +117,14 @@ export async function getTaskboardRevision(
 
 export async function getAiChatCatalog(
   projectId: string,
+  providerId: AiChatProvider = "codex",
   signal?: AbortSignal,
 ): Promise<AiChatCatalog> {
+  const query = providerId === "codex"
+    ? `projectId=${encodeURIComponent(projectId)}`
+    : new URLSearchParams({ projectId, providerId }).toString();
   return request<AiChatCatalog>(
-    `/api/local/ai/catalog?projectId=${encodeURIComponent(projectId)}`,
+    `/api/local/ai/catalog?${query}`,
     { signal },
   );
 }
@@ -154,6 +165,7 @@ export async function createAiChatThread(input: {
   title?: string;
   reasoningEffort?: string;
   sandbox?: AiChatSandbox;
+  providerId?: AiChatProvider;
 }): Promise<AiChatThread> {
   const data = await request<{ thread: AiChatThread }>("/api/local/ai/threads", {
     method: "POST",
@@ -238,6 +250,11 @@ export function subscribeAiChatThread(
 
 export async function listCodexRepositories(signal?: AbortSignal): Promise<CodexRepository[]> {
   const data = await request<{ repositories: CodexRepository[] }>("/api/codex-repositories", { signal });
+  return data.repositories;
+}
+
+export async function listAgentRepositories(signal?: AbortSignal): Promise<CodexRepository[]> {
+  const data = await request<{ repositories: CodexRepository[] }>("/api/repositories", { signal });
   return data.repositories;
 }
 
@@ -407,6 +424,13 @@ export async function setTomatoAnalysisProgress(running: boolean, itemKey: strin
 export async function openCodexThread(threadId: string): Promise<void> {
   await request<{ threadId: string }>(
     `/api/local/codex/threads/${encodeURIComponent(threadId)}/open`,
+    { method: "POST" },
+  );
+}
+
+export async function openNativeAiThread(threadId: string): Promise<void> {
+  await request<{ threadId: string; providerId: AiChatProvider }>(
+    `/api/local/ai/threads/${encodeURIComponent(threadId)}/open-native`,
     { method: "POST" },
   );
 }

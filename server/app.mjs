@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open as openFile, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isIP } from "node:net";
 import "./env.mjs";
@@ -22,6 +22,7 @@ import { TomatoSyncService } from "./tomato-sync.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
+const AGENT_EXECUTABLE_MARKER = "__TOMATO_AGENT_EXECUTABLE__=";
 const JSON_BODY_LIMIT = 1024 * 1024;
 const ATTACHMENT_BODY_LIMIT = 25 * 1024 * 1024;
 const AI_CHAT_TURN_BODY_LIMIT = 25 * 1024 * 1024;
@@ -60,6 +61,39 @@ const CONTENT_TYPES = new Map([
   [".woff2", "font/woff2"],
 ]);
 
+async function inspectAgentRuntime(executable) {
+  if (path.isAbsolute(executable)) {
+    const result = await execFileAsync(executable, ["--version"], {
+      encoding: "utf8",
+      timeout: 10_000,
+      maxBuffer: 64 * 1024,
+    });
+    return {
+      executable,
+      version: [result.stdout, result.stderr].map((value) => value?.trim()).filter(Boolean).join("\n"),
+    };
+  }
+
+  const loginShell = process.env.SHELL || "/bin/zsh";
+  const script = [
+    'agent_executable="$(command -v -- "$1")" || exit 127',
+    `printf '${AGENT_EXECUTABLE_MARKER}%s\\n' "$agent_executable"`,
+    '"$agent_executable" --version',
+  ].join("; ");
+  const result = await execFileAsync(loginShell, ["-lic", script, "tomato-agent-check", executable], {
+    encoding: "utf8",
+    timeout: 10_000,
+    maxBuffer: 64 * 1024,
+  });
+  const output = [result.stdout, result.stderr].map((value) => value?.trim()).filter(Boolean).join("\n");
+  const lines = output.split("\n");
+  const executableLine = lines.find((line) => line.startsWith(AGENT_EXECUTABLE_MARKER));
+  return {
+    executable: executableLine?.slice(AGENT_EXECUTABLE_MARKER.length) || executable,
+    version: lines.filter((line) => !line.startsWith(AGENT_EXECUTABLE_MARKER)).join("\n").trim(),
+  };
+}
+
 async function openCodexThreadWithSystem(threadId) {
   const query = new URLSearchParams({
     source: "tomato-workboard",
@@ -75,6 +109,26 @@ async function openCodexThreadWithSystem(threadId) {
     return;
   }
   await execFileAsync("xdg-open", [url], { timeout: 5_000 });
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
+async function openClaudeThreadWithSystem(thread, executable) {
+  if (process.platform !== "darwin") {
+    throw new ApiError(501, "UNSUPPORTED_PLATFORM", "当前系统暂不支持自动打开 Claude Code 会话");
+  }
+  const command = [
+    `cd ${shellQuote(thread.origin.workspacePath)}`,
+    `exec ${shellQuote(executable)} --resume ${shellQuote(thread.nativeThreadId)}`,
+  ].join(" && ");
+  await execFileAsync("/usr/bin/osascript", [
+    "-e",
+    `tell application "Terminal" to do script ${JSON.stringify(command)}`,
+    "-e",
+    "tell application \"Terminal\" to activate",
+  ], { timeout: 5_000 });
 }
 
 function sendJson(response, status, value, headers = {}) {
@@ -809,6 +863,7 @@ function parseAiThreadCreate(body) {
     "title",
     "reasoningEffort",
     "sandbox",
+    "providerId",
   ]));
   return {
     projectId: validateProjectId(body.projectId),
@@ -819,6 +874,15 @@ function parseAiThreadCreate(body) {
     title: parseAiSetting(body.title, "title", 160),
     reasoningEffort: parseAiSetting(body.reasoningEffort, "reasoningEffort", 64),
     sandbox: parseAiSandbox(body.sandbox),
+    providerId: body.providerId === undefined
+      ? "codex"
+      : (() => {
+        const providerId = parseAiSetting(body.providerId, "providerId", 32);
+        if (providerId !== "codex" && providerId !== "claude-code") {
+          throw new ApiError(400, "INVALID_FIELD", "'providerId' must be codex or claude-code");
+        }
+        return providerId;
+      })(),
   };
 }
 
@@ -1343,6 +1407,7 @@ async function readCodexRepositories(codexStatePath) {
         workspacePath: root,
         currentBranch: currentResult.stdout.trim() || null,
         branches: branchesResult.stdout.split("\n").map((branch) => branch.trim()).filter(Boolean),
+        sources: ["codex"],
       });
       continue;
     } catch {
@@ -1354,9 +1419,89 @@ async function readCodexRepositories(codexStatePath) {
       workspacePath: root,
       currentBranch: null,
       branches: [],
+      sources: ["codex"],
     });
   }
   return repositories;
+}
+
+async function readClaudeRepositories(claudeProjectsPath) {
+  const workspacePaths = new Set();
+  let projectDirectories = [];
+  try {
+    projectDirectories = await readdir(claudeProjectsPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  for (const directory of projectDirectories) {
+    if (!directory.isDirectory()) continue;
+    let sessions = [];
+    try {
+      sessions = await readdir(path.join(claudeProjectsPath, directory.name), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const session of sessions) {
+      if (!session.isFile() || !session.name.endsWith(".jsonl")) continue;
+      let handle;
+      let foundWorkspace = false;
+      try {
+        handle = await openFile(path.join(claudeProjectsPath, directory.name, session.name), "r");
+        const buffer = Buffer.alloc(128 * 1024);
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+        for (const line of buffer.subarray(0, bytesRead).toString("utf8").split("\n")) {
+          if (!line.includes('"cwd"')) continue;
+          try {
+            const entry = JSON.parse(line);
+            if (typeof entry.cwd === "string" && path.isAbsolute(entry.cwd)) {
+              workspacePaths.add(entry.cwd);
+              foundWorkspace = true;
+            }
+          } catch {}
+          if (workspacePaths.size > 0) break;
+        }
+      } catch {} finally {
+        await handle?.close().catch(() => {});
+      }
+      if (foundWorkspace) break;
+    }
+  }
+  const repositories = [];
+  for (const workspacePath of workspacePaths) {
+    try {
+      if (!(await stat(workspacePath)).isDirectory()) continue;
+      const rootResult = await execFileAsync("git", ["-C", workspacePath, "rev-parse", "--show-toplevel"], {
+        timeout: 4_000, maxBuffer: 1024 * 1024,
+      });
+      const root = rootResult.stdout.trim() || workspacePath;
+      const [currentResult, branchesResult] = await Promise.all([
+        execFileAsync("git", ["-C", root, "branch", "--show-current"], { timeout: 4_000, maxBuffer: 1024 * 1024 }),
+        execFileAsync("git", ["-C", root, "for-each-ref", "--format=%(refname:short)", "refs/heads"], { timeout: 4_000, maxBuffer: 1024 * 1024 }),
+      ]);
+      repositories.push({
+        projectId: `claude:${root}`,
+        name: path.basename(root),
+        workspacePath: root,
+        currentBranch: currentResult.stdout.trim() || null,
+        branches: branchesResult.stdout.split("\n").map((branch) => branch.trim()).filter(Boolean),
+        sources: ["claude-code"],
+      });
+    } catch {}
+  }
+  return repositories;
+}
+
+function mergeAgentRepositories(...groups) {
+  const merged = new Map();
+  for (const repository of groups.flat()) {
+    const existing = merged.get(repository.workspacePath);
+    if (!existing) {
+      merged.set(repository.workspacePath, repository);
+      continue;
+    }
+    existing.sources = [...new Set([...(existing.sources ?? []), ...(repository.sources ?? [])])];
+  }
+  return [...merged.values()];
 }
 
 async function resolveAnalysisRepositories(resolved) {
@@ -1382,7 +1527,9 @@ export function resolveServerOptions(options = {}) {
     ? path.resolve(configuredDataDirectory)
     : path.join(PROJECT_ROOT, ".data");
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  const claudeHome = process.env.CLAUDE_HOME || path.join(os.homedir(), ".claude");
   const codexExecutable = options.codexExecutable ?? process.env.CODEX_EXECUTABLE ?? "codex";
+  const claudeExecutable = options.claudeExecutable ?? process.env.CLAUDE_EXECUTABLE ?? "claude";
   const analysisRepositories = parseAnalysisRepositories(
     options.analysisRepositories ?? process.env.TOMATO_ANALYSIS_REPOSITORIES,
   );
@@ -1405,6 +1552,8 @@ export function resolveServerOptions(options = {}) {
     staticDirectory: options.staticDirectory ?? path.join(PROJECT_ROOT, "dist", "web"),
     skillPath: options.skillPath ?? path.join(PROJECT_ROOT, "skills", "tomato-workboard", "SKILL.md"),
     codexExecutable,
+    claudeExecutable,
+    claudeProjectsPath: options.claudeProjectsPath ?? path.join(claudeHome, "projects"),
     tomatoCliExecutable: options.tomatoCliExecutable
       ?? process.env.TOMATO_CLI_EXECUTABLE
       ?? "gitee",
@@ -1443,6 +1592,7 @@ export function createTaskboardServer(options = {}) {
   const aiChat = new AiChatService({
     database,
     codexExecutable: resolved.codexExecutable,
+    claudeExecutable: resolved.claudeExecutable,
     codexStatePath: resolved.codexStatePath,
     fallbackWorkspacePath: PROJECT_ROOT,
     tomatoWorkboardSkillPath: resolved.skillPath,
@@ -1492,11 +1642,37 @@ export function createTaskboardServer(options = {}) {
         });
       }
 
+      if (pathname === "/api/agent-runtimes" || pathname === "/api/local/agent-runtimes") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, `GET ${pathname}`);
+        const runtimes = await Promise.all([
+          { providerId: "codex", name: "Codex", executable: resolved.codexExecutable },
+          { providerId: "claude-code", name: "Claude Code", executable: resolved.claudeExecutable },
+        ].map(async (runtime) => {
+          try {
+            const inspection = await inspectAgentRuntime(runtime.executable);
+            return { ...runtime, ...inspection, available: true };
+          } catch (error) {
+            return {
+              ...runtime,
+              available: false,
+              version: "",
+              error: error?.code === "ENOENT" ? "未找到该命令" : (error?.message ?? "检查失败"),
+            };
+          }
+        }));
+        return sendJson(response, 200, { runtimes });
+      }
+
       if (pathname === "/api/local/ai/catalog") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
-        assertAllowedQuery(url.searchParams, new Set(["projectId"]), "GET /api/local/ai/catalog");
+        assertAllowedQuery(url.searchParams, new Set(["projectId", "providerId"]), "GET /api/local/ai/catalog");
         const projectId = validateProjectId(url.searchParams.get("projectId") ?? undefined);
-        return sendJson(response, 200, await aiChat.getCatalog(projectId));
+        const providerId = url.searchParams.get("providerId") ?? "codex";
+        if (providerId !== "codex" && providerId !== "claude-code") {
+          throw new ApiError(400, "INVALID_FIELD", "providerId must be codex or claude-code");
+        }
+        return sendJson(response, 200, await aiChat.getCatalog(projectId, providerId));
       }
 
       if (pathname === "/api/local/tomato/session") {
@@ -1800,6 +1976,24 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "PATCH", "DELETE"]);
       }
 
+      const openNativeAiThreadRoute = pathname.match(/^\/api\/local\/ai\/threads\/([^/]+)\/open-native$/);
+      if (openNativeAiThreadRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/ai/threads/:id/open-native");
+        await assertEmptyRequestBody(request, "POST /api/local/ai/threads/:id/open-native");
+        const threadId = decodeRouteSegment(openNativeAiThreadRoute[1], "Thread id");
+        const thread = database.getAiChatThread(threadId);
+        if (!thread) throw new ApiError(404, "NOT_FOUND", "Agent 会话不存在");
+        if (!thread.nativeThreadId) throw new ApiError(409, "NATIVE_THREAD_PENDING", "发送第一条消息后才能打开原生 Agent 会话");
+        if (thread.providerId === "claude-code") {
+          await openClaudeThreadWithSystem(thread, resolved.claudeExecutable);
+        } else {
+          await aiChat.syncNativeThreadName(thread.nativeThreadId).catch(() => null);
+          await openCodexThread(thread.nativeThreadId);
+        }
+        return sendJson(response, 200, { threadId, providerId: thread.providerId });
+      }
+
       const aiInterruptRoute = pathname.match(/^\/api\/local\/ai\/runs\/([^/]+)\/interrupt$/);
       if (aiInterruptRoute) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
@@ -1826,6 +2020,18 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/codex-repositories does not accept query parameters");
         }
         return sendJson(response, 200, { repositories: await readCodexRepositories(resolved.codexStatePath) });
+      }
+
+      if (pathname === "/api/repositories") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/repositories");
+        const [codexRepositories, claudeRepositories] = await Promise.all([
+          readCodexRepositories(resolved.codexStatePath),
+          readClaudeRepositories(resolved.claudeProjectsPath),
+        ]);
+        return sendJson(response, 200, {
+          repositories: mergeAgentRepositories(codexRepositories, claudeRepositories),
+        });
       }
 
       if (pathname === "/api/workflow-capabilities") {

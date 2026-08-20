@@ -28,7 +28,6 @@ interface TaskCardProps {
   onOpenThread: (threadId: string) => void;
   onToggleTomatoAnalysis?: (task: Task) => void;
   externalUrl?: string | null;
-  onExternalLinkFallback?: (url: string) => void;
   displayIdentifier?: string;
   displayTitle?: string;
   hideAssignee?: boolean;
@@ -60,7 +59,6 @@ export function TaskCard({
   onOpenThread,
   onToggleTomatoAnalysis,
   externalUrl = null,
-  onExternalLinkFallback,
   displayIdentifier,
   displayTitle,
   hideAssignee = false,
@@ -89,8 +87,7 @@ export function TaskCard({
     event.preventDefault();
     event.stopPropagation();
     if (!externalUrl) return;
-    const opened = window.open(externalUrl, "_blank", "noopener,noreferrer");
-    if (!opened) onExternalLinkFallback?.(externalUrl);
+    window.location.assign(externalUrl);
   }
 
   return (
@@ -143,8 +140,6 @@ export function TaskCard({
           <a
             className="card-external-link"
             href={externalUrl}
-            target="_blank"
-            rel="noopener noreferrer"
             aria-label={`在浏览器打开 ${task.title}`}
             title="在浏览器打开番茄卡片"
             onClick={openExternal}

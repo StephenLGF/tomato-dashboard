@@ -13,12 +13,11 @@ import { LinearIcon, LinearPriorityIcon } from "./LinearIcon";
 
 interface TomatoTaskDetailProps {
   task: Task;
+  onBack: () => void;
   tomatoConfig?: { origin: string; tenant: string };
   conversation: ReactNode;
   onAgentTransition: (itemKey: string, targetStatus: string) => Promise<boolean>;
   onTransitionComplete: () => Promise<void>;
-  onExternalLinkFallback: (url: string) => void;
-  onCopyLink: (url: string) => void;
   onError: (message: string | null) => void;
   onAnnounce: (message: string) => void;
   repositoryOptions: Array<{
@@ -73,12 +72,11 @@ function exactTime(value: string): string {
 
 export function TomatoTaskDetail({
   task,
+  onBack,
   tomatoConfig,
   conversation,
   onAgentTransition,
   onTransitionComplete,
-  onExternalLinkFallback,
-  onCopyLink,
   onError,
   onAnnounce,
   repositoryOptions,
@@ -90,7 +88,6 @@ export function TomatoTaskDetail({
 }: TomatoTaskDetailProps) {
   const metadata = tomatoMetadata(task.description);
   const itemKey = metadata["番茄事项"] || task.title.match(/^\[([^\]]+)\]/)?.[1] || task.identifier;
-  const title = task.title.replace(/^\[[^\]]+\]\s*/, "");
   const itemType = metadata["类型"] || "";
   const currentStatus = metadata["当前状态"] || "未设置";
   const externalUrl = tomatoItemUrl(itemKey, tomatoConfig);
@@ -168,8 +165,7 @@ export function TomatoTaskDetail({
   function openExternal(event: MouseEvent<HTMLAnchorElement>) {
     event.preventDefault();
     if (!externalUrl) return;
-    const opened = window.open(externalUrl, "_blank", "noopener,noreferrer");
-    if (!opened) onExternalLinkFallback(externalUrl);
+    window.location.assign(externalUrl);
   }
 
   async function transitionTo(action: TomatoQuickAction, requiresAgentPreflight: boolean) {
@@ -286,19 +282,53 @@ export function TomatoTaskDetail({
     );
   }
 
+  function renderQuickActions() {
+    return quickActions.map((action) => {
+      const { targetStatus, noFixReason } = action;
+      const transition = transitionsByTarget.get(targetStatus);
+      const requiresAgentPreflight = transition?.requiresAgentPreflight === true;
+      const unavailable = !transition || (transition.disabled && !requiresAgentPreflight && !noFixReason);
+      const busy = transitioningTo === targetStatus;
+      const disabled = transitionsLoading || Boolean(transitioningTo)
+        || currentStatus === targetStatus || unavailable;
+      const buttonTitle = currentStatus === targetStatus
+        ? `当前已经是「${targetStatus}」`
+        : requiresAgentPreflight
+          ? `${transition?.disabledReason}；点击后由 Codex 按 skill 补齐并流转`
+          : transition?.disabledReason
+          || (transitionsLoading ? "正在读取可用流转" : `当前状态无法直接流转到「${targetStatus}」`);
+      return (
+        <button
+          key={targetStatus}
+          className="tomato-transition-button"
+          type="button"
+          disabled={disabled}
+          title={buttonTitle}
+          onClick={() => void transitionTo(action, requiresAgentPreflight)}
+        >
+          {busy ? (requiresAgentPreflight ? "正在交给 Codex…" : "流转中…") : action.label}
+        </button>
+      );
+    });
+  }
+
   return (
     <section className="tomato-detail" aria-label={`${itemKey} 番茄事项详情`}>
       <div className="tomato-detail-content">
         <main className="tomato-detail-main">
           <div className="tomato-detail-heading-row">
-            <span className="tomato-detail-key">{itemKey}</span>
-            {externalUrl && (
-              <div className="tomato-detail-heading-actions">
+            <div className="tomato-detail-heading-identity">
+              <button className="tomato-detail-back" type="button" onClick={onBack} aria-label="返回工作台" title="返回工作台">
+                <LinearIcon name="chevronLeft" />
+              </button>
+              <span className="tomato-detail-key">{itemKey}</span>
+            </div>
+            <div className="tomato-detail-heading-actions">
+              {renderQuickActions()}
+              {externalUrl && (
                 <a
                   className="tomato-detail-external-link"
                   href={externalUrl}
-                  target="_blank"
-                  rel="noreferrer"
                   title="在浏览器中打开番茄事项"
                   aria-label={`在浏览器中打开 ${itemKey}`}
                   onClick={openExternal}
@@ -306,58 +336,12 @@ export function TomatoTaskDetail({
                   <LinearIcon name="openExternal" />
                   <span>打开番茄</span>
                 </a>
-                <button
-                  className="tomato-detail-copy-button"
-                  type="button"
-                  title="复制番茄链接"
-                  aria-label={`复制 ${itemKey} 番茄链接`}
-                  onClick={() => onCopyLink(externalUrl)}
-                >
-                  <LinearIcon name="copy" />
-                  <span>复制</span>
-                </button>
-              </div>
-            )}
-          </div>
-          <h1>{title}</h1>
-
-          {quickActions.length > 0 && (
-            <div className="tomato-detail-transition-actions" aria-label="快捷流转">
-              {quickActions.map((action) => {
-                const { targetStatus, noFixReason } = action;
-                const transition = transitionsByTarget.get(targetStatus);
-                const requiresAgentPreflight = transition?.requiresAgentPreflight === true;
-                const unavailable = !transition
-                  || (transition.disabled && !requiresAgentPreflight && !noFixReason);
-                const busy = transitioningTo === targetStatus;
-                const disabled = transitionsLoading || Boolean(transitioningTo)
-                  || currentStatus === targetStatus || unavailable;
-                const buttonTitle = currentStatus === targetStatus
-                  ? `当前已经是「${targetStatus}」`
-                  : requiresAgentPreflight
-                    ? `${transition?.disabledReason}；点击后由 Codex 按 skill 补齐并流转`
-                    : transition?.disabledReason
-                    || (transitionsLoading ? "正在读取可用流转" : `当前状态无法直接流转到「${targetStatus}」`);
-                return (
-                  <button
-                    key={targetStatus}
-                    className="tomato-transition-button"
-                    type="button"
-                    disabled={disabled}
-                    title={buttonTitle}
-                    onClick={() => void transitionTo(action, requiresAgentPreflight)}
-                  >
-                    {busy
-                      ? (requiresAgentPreflight ? "正在交给 Codex…" : "流转中…")
-                      : action.label}
-                  </button>
-                );
-              })}
+              )}
             </div>
-          )}
+          </div>
 
           {task.tomatoAnalysis && (
-            <details className={`tomato-detail-analysis tomato-analysis-${task.tomatoAnalysis.status}`} open>
+            <details className={`tomato-detail-analysis tomato-analysis-${task.tomatoAnalysis.status}`}>
               <summary className="tomato-detail-analysis-heading">
                 <div>
                   <span>AI 分析结果</span>
@@ -416,7 +400,7 @@ export function TomatoTaskDetail({
                 <div>
                   <span className="tomato-repository-setup-kicker">开始处理前需要一步配置</span>
                   <h2 id="tomato-repository-setup-heading">先配置修复仓库与分支</h2>
-                  <p>配置完成后，修复仓库会显示在右侧属性栏，对话区也会开放。</p>
+                  <p>配置后，新建 Agent 会话即可在对应仓库中工作。</p>
                 </div>
               </div>
               <div className="tomato-repository-setup-fields">
@@ -425,18 +409,13 @@ export function TomatoTaskDetail({
             </section>
           )}
 
-          {repositoryConfigured && (
-            <section className="tomato-detail-conversations" aria-labelledby="tomato-conversations-heading">
-              <header>
-                <h2 id="tomato-conversations-heading">对话记录</h2>
-              </header>
-              {conversation}
-            </section>
-          )}
+          <section className="tomato-detail-conversations" aria-label="Agent 会话">
+            {conversation}
+          </section>
         </main>
 
         <aside className="tomato-detail-sidebar" aria-label="番茄事项属性">
-          <h2>属性</h2>
+          <h2>卡片信息</h2>
           {repositoryConfigured && (
             <section className="tomato-branch-settings" aria-label="修复基线分支设置">
               <div className="tomato-branch-settings-heading">
@@ -471,8 +450,8 @@ export function TomatoTaskDetail({
               <dd>{metadata["工作区"] || "未设置"}</dd>
             </div>
           </dl>
-          <section className="tomato-detail-more" aria-labelledby="tomato-detail-more-heading">
-            <h2 id="tomato-detail-more-heading">详细信息</h2>
+          <details className="tomato-detail-more">
+            <summary>详细信息</summary>
             <dl className="tomato-detail-metadata">
               <div><dt>任务编号</dt><dd>{task.identifier}</dd></div>
               <div><dt>创建者</dt><dd title={`@${task.creatorId}`}>{task.creatorName}</dd></div>
@@ -483,7 +462,7 @@ export function TomatoTaskDetail({
               <div><dt>创建时间</dt><dd title={exactTime(task.createdAt)}>{exactTime(task.createdAt)}</dd></div>
               <div><dt>更新时间</dt><dd title={exactTime(task.updatedAt)}>{exactTime(task.updatedAt)}</dd></div>
             </dl>
-          </section>
+          </details>
         </aside>
       </div>
     </section>

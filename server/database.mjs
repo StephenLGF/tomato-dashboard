@@ -186,7 +186,11 @@ function aiChatThreadFromRow(row) {
       ...(row.origin_issue_id ? { issueId: row.origin_issue_id } : {}),
       ...(row.origin_issue_identifier ? { issueIdentifier: row.origin_issue_identifier } : {}),
     },
-    codexThreadId: row.codex_thread_id,
+    providerId: row.provider_id ?? "codex",
+    nativeThreadId: row.native_thread_id ?? row.codex_thread_id,
+    codexThreadId: (row.provider_id ?? "codex") === "codex"
+      ? (row.native_thread_id ?? row.codex_thread_id)
+      : null,
     gitBranch: row.git_branch,
     reasoningEffort: row.reasoning_effort,
     sandbox: row.sandbox,
@@ -424,6 +428,13 @@ export class TaskboardDatabase {
     }
     if (aiChatThreadColumns.some((column) => column.name === "model")) {
       this.database.exec("ALTER TABLE ai_chat_threads DROP COLUMN model");
+    }
+    if (!aiChatThreadColumns.some((column) => column.name === "provider_id")) {
+      this.database.exec("ALTER TABLE ai_chat_threads ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'codex'");
+    }
+    if (!aiChatThreadColumns.some((column) => column.name === "native_thread_id")) {
+      this.database.exec("ALTER TABLE ai_chat_threads ADD COLUMN native_thread_id TEXT");
+      this.database.exec("UPDATE ai_chat_threads SET native_thread_id = codex_thread_id WHERE codex_thread_id IS NOT NULL");
     }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
@@ -842,9 +853,9 @@ export class TaskboardDatabase {
         id, title, status,
         origin_project_id, origin_project_name, origin_workspace_path,
         origin_issue_id, origin_issue_identifier,
-        codex_thread_id, git_branch, reasoning_effort, sandbox,
+        codex_thread_id, provider_id, native_thread_id, git_branch, reasoning_effort, sandbox,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.title,
@@ -854,7 +865,9 @@ export class TaskboardDatabase {
       input.origin.workspacePath,
       input.origin.issueId ?? null,
       input.origin.issueIdentifier ?? null,
-      input.codexThreadId ?? null,
+      input.providerId === "codex" ? (input.nativeThreadId ?? input.codexThreadId ?? null) : null,
+      input.providerId ?? "codex",
+      input.nativeThreadId ?? input.codexThreadId ?? null,
       input.gitBranch ?? null,
       input.reasoningEffort,
       input.sandbox,
@@ -873,6 +886,7 @@ export class TaskboardDatabase {
       title: "title",
       status: "status",
       codexThreadId: "codex_thread_id",
+      nativeThreadId: "native_thread_id",
       gitBranch: "git_branch",
       originIssueIdentifier: "origin_issue_identifier",
       reasoningEffort: "reasoning_effort",

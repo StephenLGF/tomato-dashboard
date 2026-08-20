@@ -1,7 +1,7 @@
 {
   "name": "tomato-dashboard",
-  "version": "0.1.0",
-  "description": "将番茄事项、开发仓库与 Codex 对话连接起来的本地工作台。",
+  "version": "0.2.0",
+  "description": "将番茄事项、开发仓库与 Codex、Claude Code 对话连接起来的本地工作台。",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -28,6 +28,7 @@
   "dependencies": {
     "@lobehub/icons-static-svg": "^1.94.0",
     "@xyflow/react": "^12.11.3",
+    "antd": "^6.6.1",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-markdown": "^10.1.0",

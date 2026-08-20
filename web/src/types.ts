@@ -48,6 +48,7 @@ export interface CodexRepository {
   workspacePath: string;
   currentBranch: string | null;
   branches: string[];
+  sources?: Array<"codex" | "claude-code">;
 }
 
 export interface TaskboardMetadata {
@@ -67,6 +68,15 @@ export interface TaskboardCapabilities {
 }
 
 export type AiChatSandbox = "read-only" | "workspace-write" | "danger-full-access";
+export type AiChatProvider = "codex" | "claude-code";
+export interface AgentRuntimeConfig {
+  providerId: AiChatProvider;
+  name: string;
+  executable: string;
+  available: boolean;
+  version: string;
+  error?: string;
+}
 export type AiChatThreadStatus = "idle" | "running" | "failed";
 export type AiChatRunStatus = "running" | "completed" | "failed" | "interrupted";
 
@@ -94,6 +104,8 @@ export interface AiChatAttachmentInput {
 }
 
 export interface AiChatCatalog {
+  providerId?: AiChatProvider;
+  agents?: Array<{ id: string; name: string }>;
   models: AiChatModel[];
   skills: AiChatSkill[];
   sandboxes: string[];
@@ -123,6 +135,8 @@ export interface AiChatThread {
   status: AiChatThreadStatus;
   origin: AiChatOrigin;
   codexThreadId: string | null;
+  providerId: AiChatProvider;
+  nativeThreadId: string | null;
   gitBranch: string | null;
   reasoningEffort: string;
   sandbox: AiChatSandbox;

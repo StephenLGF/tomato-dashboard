@@ -21,6 +21,7 @@ import {
   interruptAiChatRun,
   listAiChatThreads,
   listAiChatThreadsForIssueIdentifier,
+  openNativeAiThread,
   startAiChatTurn,
   subscribeAiChatThread,
   updateAiChatThread,
@@ -42,6 +43,7 @@ import type {
   AiChatCatalog,
   AiChatEvent,
   AiChatModel,
+  AiChatProvider,
   AiChatRun,
   AiChatSandbox,
   AiChatSkill,
@@ -62,6 +64,9 @@ interface AiChatProps {
   hideRepositoryPicker?: boolean;
   inline?: boolean;
   onOpenThread?: (threadId: string, title?: string) => void;
+  requestedThreadId?: string | null;
+  onSelectedThreadChange?: (threadId: string | null) => void;
+  headerTitle?: string;
 }
 
 export interface AiChatHandle {
@@ -802,18 +807,22 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
   hideRepositoryPicker = false,
   inline = false,
   onOpenThread,
+  requestedThreadId = null,
+  onSelectedThreadChange,
+  headerTitle,
 }, ref) {
   const [panelOpen, setPanelOpen] = useState(inline);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [menu, setMenu] = useState<MenuName>(null);
   const [threads, setThreads] = useState<AiChatThread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(
-    () => window.localStorage.getItem(LAST_THREAD_KEY),
+    () => requestedThreadId ?? window.localStorage.getItem(LAST_THREAD_KEY),
   );
   const [snapshot, setSnapshot] = useState<AiChatThreadSnapshot | null>(null);
   const [draftOrigin, setDraftOrigin] = useState<DraftThreadOrigin | null>(null);
   const [catalog, setCatalog] = useState<AiChatCatalog | null>(null);
   const [catalogLoadedProjectId, setCatalogLoadedProjectId] = useState<string | null>(null);
+  const [catalogLoadedProviderId, setCatalogLoadedProviderId] = useState<AiChatProvider | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -824,10 +833,15 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
   const [composerSkillTokens, setComposerSkillTokens] = useState<ComposerSkillToken[]>([]);
   const [unread, setUnread] = useState(false);
   const [draftModel, setDraftModel] = useState(DEFAULT_AI_MODEL);
+  const [draftProvider, setDraftProvider] = useState<AiChatProvider>("codex");
   const [draftEffort, setDraftEffort] = useState("");
   const [draftSandbox, setDraftSandbox] = useState<AiChatSandbox>(DEFAULT_AI_SANDBOX);
   const [settingsSaving, setSettingsSaving] = useState(false);
-  const [deletingThreadId, setDeletingThreadId] = useState<string | null>(null);
+  const [threadContextMenu, setThreadContextMenu] = useState<{
+    thread: AiChatThread;
+    x: number;
+    y: number;
+  } | null>(null);
   const [panelGeometry, setPanelGeometry] = useState<PanelGeometry | null>(
     () => window.innerWidth <= 719 ? null : loadPanelGeometry(),
   );
@@ -852,31 +866,70 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
   const selectThread = useCallback((threadId: string | null) => {
     selectedThreadRef.current = threadId;
     setSelectedThreadId(threadId);
-  }, []);
+    onSelectedThreadChange?.(threadId);
+  }, [onSelectedThreadChange]);
+
+  useEffect(() => {
+    if (!threadContextMenu) return;
+    const dismiss = () => setThreadContextMenu(null);
+    const dismissOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") dismiss();
+    };
+    window.addEventListener("pointerdown", dismiss);
+    window.addEventListener("blur", dismiss);
+    window.addEventListener("keydown", dismissOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("blur", dismiss);
+      window.removeEventListener("keydown", dismissOnEscape);
+    };
+  }, [threadContextMenu]);
+
+  async function deleteThread(thread: AiChatThread) {
+    setThreadContextMenu(null);
+    if (!window.confirm(`确定删除会话“${thread.title}”吗？`)) return;
+    setLoading(true);
+    try {
+      await deleteAiChatThread(thread.id);
+      const remaining = threads.filter((candidate) => candidate.id !== thread.id);
+      setThreads(remaining);
+      if (selectedThreadRef.current === thread.id) {
+        setSnapshot(null);
+        selectThread(remaining[0]?.id ?? null);
+      }
+      setError(null);
+    } catch (nextError) {
+      setError(messageFor(nextError));
+    } finally {
+      setLoading(false);
+    }
+  }
 
   const openNativeThread = useCallback((thread: AiChatThread) => {
-    const codexThreadId = thread.codexThreadId;
-    if (!codexThreadId) {
+    const nativeThreadId = thread.nativeThreadId;
+    if (!nativeThreadId) {
       setError(
         thread.status === "running"
-          ? "原生 Codex 对话正在创建，请稍后再试"
-          : "当前对话尚未生成原生 Codex 线程，请先发送一条消息",
+          ? `原生 ${thread.providerId === "claude-code" ? "Claude Code" : "Codex"} 会话正在创建，请稍后再试`
+          : "当前对话尚未生成原生 Agent 会话，请先发送一条消息",
       );
       return;
     }
     setError(null);
-    if (onOpenThread) {
-      onOpenThread(codexThreadId, thread.title);
+    if (thread.providerId === "codex" && onOpenThread) {
+      onOpenThread(nativeThreadId, thread.title);
       return;
     }
-    if (window.parent !== window) {
+    if (thread.providerId === "codex" && window.parent !== window) {
       window.parent.postMessage({
         type: "taskboard:open-thread",
-        payload: { threadId: codexThreadId },
+        payload: { threadId: nativeThreadId },
       }, "*");
       return;
     }
-    window.location.assign(`codex://threads/${encodeURIComponent(codexThreadId)}`);
+    void openNativeAiThread(thread.id).catch((nextError) => {
+      setError(messageFor(nextError));
+    });
   }, [onOpenThread]);
 
   const openNativeReview = useCallback(() => {
@@ -1081,27 +1134,26 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
       const next = issueIdentifier
         ? await listAiChatThreadsForIssueIdentifier(issueIdentifier)
         : await listAiChatThreads();
-      const visibleThreads = singleIssueConversation
-        ? (repositorySelectionEnabled
-          ? (effectiveProjectId
-            ? next.filter((thread) => thread.origin.projectId === effectiveProjectId).slice(0, 1)
-            : [])
-          : next.slice(0, 1))
-        : next;
+      const visibleThreads = next;
       setThreads(visibleThreads);
-      setSelectedThreadId((current) => {
-        const selected = singleIssueConversation
-          ? visibleThreads[0]?.id ?? null
-          : current && visibleThreads.some((thread) => thread.id === current)
-            ? current
-            : visibleThreads[0]?.id ?? null;
-        selectedThreadRef.current = selected;
-        return selected;
-      });
+      const current = selectedThreadRef.current;
+      const selected = requestedThreadId && visibleThreads.some((thread) => thread.id === requestedThreadId)
+        ? requestedThreadId
+        : current && visibleThreads.some((thread) => thread.id === current)
+          ? current
+          : visibleThreads[0]?.id ?? null;
+      selectedThreadRef.current = selected;
+      setSelectedThreadId(selected);
+      onSelectedThreadChange?.(selected);
     } catch (nextError) {
       setError(messageFor(nextError));
     }
-  }, [effectiveProjectId, issueIdentifier, repositorySelectionEnabled, singleIssueConversation]);
+  }, [issueIdentifier, onSelectedThreadChange]);
+
+  useEffect(() => {
+    if (draftOrigin || !requestedThreadId || requestedThreadId === selectedThreadRef.current) return;
+    if (threads.some((thread) => thread.id === requestedThreadId)) selectThread(requestedThreadId);
+  }, [draftOrigin, requestedThreadId, selectThread, threads]);
 
   useEffect(() => {
     if (!available) {
@@ -1182,23 +1234,28 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
     ?? selectedThreadSummary?.origin.projectId
     ?? draftOrigin?.projectId
     ?? effectiveProjectId;
-  const activeCatalog = catalogLoadedProjectId === catalogProjectId ? catalog : null;
+  const activeProviderId = snapshot?.thread.providerId ?? selectedThreadSummary?.providerId ?? draftProvider;
+  const activeCatalog = catalogLoadedProjectId === catalogProjectId
+    && catalogLoadedProviderId === activeProviderId ? catalog : null;
   useEffect(() => {
     if (!available || !catalogProjectId) {
       setCatalog(null);
       setCatalogLoadedProjectId(null);
+      setCatalogLoadedProviderId(null);
       setCatalogError(null);
       return;
     }
     const controller = new AbortController();
     setCatalog(null);
     setCatalogLoadedProjectId(null);
+    setCatalogLoadedProviderId(null);
     setCatalogError(null);
-    void getAiChatCatalog(catalogProjectId, controller.signal).then(
+    void getAiChatCatalog(catalogProjectId, activeProviderId, controller.signal).then(
       (next) => {
         if (controller.signal.aborted) return;
         setCatalog(next);
         setCatalogLoadedProjectId(catalogProjectId);
+        setCatalogLoadedProviderId(activeProviderId);
         setCatalogError(null);
       },
       (nextError) => {
@@ -1206,12 +1263,13 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
         if ((nextError as Error).name !== "AbortError") {
           setCatalog(null);
           setCatalogLoadedProjectId(null);
+          setCatalogLoadedProviderId(null);
           setCatalogError(messageFor(nextError));
         }
       },
     );
     return () => controller.abort();
-  }, [available, catalogProjectId]);
+  }, [activeProviderId, available, catalogProjectId]);
 
   const restoreDraftSettings = useCallback((thread: AiChatThread) => {
     const normalized = normalizeChatSelection(
@@ -1289,10 +1347,7 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
   const currentRun = snapshot?.thread.currentRun
     ?? snapshot?.runs.find((run) => run.status === "running")
     ?? null;
-  const composerBlocked = Boolean(
-    (repositorySelectionEnabled && !effectiveProjectId)
-    || (selectedThreadId && deletingThreadId === selectedThreadId),
-  );
+  const composerBlocked = Boolean(repositorySelectionEnabled && !effectiveProjectId);
   const sendBlocked = loading
     || settingsSaving
     || composerBlocked
@@ -1420,9 +1475,11 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
     };
     setLoading(true);
     try {
-      const targetCatalog = catalogLoadedProjectId === input.projectId && activeCatalog
+      const targetCatalog = catalogLoadedProjectId === input.projectId
+        && catalogLoadedProviderId === draftProvider
+        && activeCatalog
         ? activeCatalog
-        : await getAiChatCatalog(input.projectId);
+        : await getAiChatCatalog(input.projectId, draftProvider);
       const normalized = normalizeChatSelection(
         targetCatalog.models,
         DEFAULT_AI_MODEL,
@@ -1440,6 +1497,7 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
       const thread = await createAiChatThread({
         ...input,
         ...settings,
+        providerId: draftProvider,
       });
       replaceThread(thread);
       selectThread(thread.id);
@@ -1454,27 +1512,6 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
       return null;
     } finally {
       setLoading(false);
-    }
-  }
-
-  async function deleteThread(thread: AiChatThread) {
-    if (!window.confirm(`删除本地对话“${thread.title}”？`)) return;
-    setDeletingThreadId(thread.id);
-    try {
-      await deleteAiChatThread(thread.id);
-      const remainingThreads = threads.filter((candidate) => candidate.id !== thread.id);
-      setThreads(remainingThreads);
-      if (selectedThreadRef.current === thread.id) {
-        setSnapshot(null);
-        setDraftOrigin(null);
-        selectThread(remainingThreads[0]?.id ?? null);
-        resetComposer();
-      }
-      setError(null);
-    } catch (nextError) {
-      setError(messageFor(nextError));
-    } finally {
-      setDeletingThreadId(null);
     }
   }
 
@@ -1783,7 +1820,7 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
 
   return (
     <div
-      className={`ai-chat-root is-${launcherState}${inline ? " is-inline" : ""}`}
+      className={`ai-chat-root is-${launcherState}${inline ? " is-inline" : ""}${singleIssueConversation ? " has-thread-list" : ""}`}
       onPointerDown={(event) => {
         if (!(event.target as HTMLElement).closest(".ai-chat-menu-wrap")) setMenu(null);
       }}
@@ -1793,8 +1830,8 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
           ref={panelRef}
           className={`ai-chat-panel${inline ? " is-inline" : ""}${panelResizeEdge ? ` is-resizing-${panelResizeEdge}` : ""}`}
           style={inline ? undefined : panelGeometry ?? undefined}
-          aria-label="Codex AI 对话"
-          data-screen-label="Codex AI 对话"
+          aria-label="Agent 对话"
+          data-screen-label="Agent 对话"
         >
           {!inline && (
             <>
@@ -1816,24 +1853,26 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
             </>
           )}
           <header className="ai-chat-panel-header">
-            <button
+            <div
               className="ai-chat-panel-title"
-              type="button"
-              disabled={!snapshot?.thread.codexThreadId}
-              title={snapshot?.thread.codexThreadId
-                ? "在 Codex 原生对话中继续"
-                : "发送第一条消息后可在 Codex 原生对话中继续"}
-              onClick={() => {
-                if (snapshot?.thread) openNativeThread(snapshot.thread);
-              }}
             >
-              <strong>{snapshot?.thread.title ?? "新对话"}</strong>
+              <strong>{headerTitle ?? snapshot?.thread.title ?? "新对话"}</strong>
               {!repositorySelectionEnabled && (
-                <span>{snapshot?.thread.codexThreadId
+                <span>{snapshot?.thread.nativeThreadId
                   ? snapshot.thread.origin.projectName
                   : snapshot?.thread.origin.projectName ?? "选择对话或从当前项目新建"}</span>
               )}
-            </button>
+            </div>
+            {snapshot?.thread.nativeThreadId && (
+              <button
+                type="button"
+                aria-label={`在 ${snapshot.thread.providerId === "claude-code" ? "Claude Code" : "Codex"} 原生会话中继续`}
+                title={`在 ${snapshot.thread.providerId === "claude-code" ? "Claude Code" : "Codex"} 原生会话中继续`}
+                onClick={() => openNativeThread(snapshot.thread)}
+              >
+                <LinearIcon name="openExternal" />
+              </button>
+            )}
             {repositorySelectionEnabled && !hideRepositoryPicker && (
               <label className="ai-chat-repository-picker">
                 <select
@@ -1886,22 +1925,54 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
             )}
           </header>
 
-          {historyOpen && !singleIssueConversation && (
-            <div className="ai-chat-history" aria-label="对话历史">
+          {(singleIssueConversation || historyOpen) && (
+            <div className={`ai-chat-history${singleIssueConversation ? " is-persistent" : ""}`} aria-label="对话历史">
               <div className="ai-chat-history-heading">
-                <strong>对话历史</strong>
-                <span>{threads.length}</span>
+                <div><strong>对话历史</strong><span>{threads.length + (draftOrigin ? 1 : 0)}</span></div>
+                {singleIssueConversation && (
+                  <button
+                    className="ai-chat-new-thread"
+                    type="button"
+                    disabled={loading}
+                    title={effectiveProjectId ? "新建 Agent 会话" : "请先在右侧配置修复仓库"}
+                    onClick={beginNewConversation}
+                  >
+                    <LinearIcon name="plus" />
+                    新建会话
+                  </button>
+                )}
               </div>
+              {draftOrigin && (
+                <div className="ai-chat-history-row is-active is-draft">
+                  <button type="button" aria-current="true" title="正在创建新会话">
+                    <span className="ai-chat-thread-status" aria-hidden="true" />
+                    <span>
+                      <span className="ai-chat-history-title">
+                        <strong>新对话</strong>
+                        <span className={`ai-chat-provider-badge is-${draftProvider}`}>
+                          {draftProvider === "claude-code" ? "Claude" : "Codex"}
+                        </span>
+                      </span>
+                      <small>尚未发送</small>
+                    </span>
+                  </button>
+                </div>
+              )}
               {threads.length > 0 ? threads.map((thread) => (
                 <div
                   className={`ai-chat-history-row${thread.id === selectedThreadId ? " is-active" : ""}`}
                   key={thread.id}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    setThreadContextMenu({ thread, x: event.clientX, y: event.clientY });
+                  }}
                 >
                   <button
                     type="button"
+                    aria-current={thread.id === selectedThreadId ? "true" : undefined}
                     title={thread.codexThreadId ? "在 Codex 原生对话中打开" : "打开本地创建记录"}
                     onClick={() => {
-                      if (thread.codexThreadId) {
+                      if (!singleIssueConversation && thread.codexThreadId) {
                         openNativeThread(thread);
                         return;
                       }
@@ -1909,30 +1980,56 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
                       draftReturnThreadIdRef.current = null;
                       setDraftOrigin(null);
                       selectThread(thread.id);
-                      setHistoryOpen(false);
+                      if (!singleIssueConversation) setHistoryOpen(false);
                     }}
                   >
                     <span className={`ai-chat-thread-status is-${thread.status}`} aria-hidden="true" />
                     <span>
-                      <strong>{thread.title}</strong>
+                      <span className="ai-chat-history-title">
+                        <strong>{thread.title}</strong>
+                        <span className={`ai-chat-provider-badge is-${thread.providerId}`}>
+                          {thread.providerId === "claude-code" ? "Claude" : "Codex"}
+                        </span>
+                      </span>
                       <small>{thread.origin.projectName} · {dateLabel(thread.updatedAt)}</small>
                     </span>
                   </button>
                   <button
-                    className="ai-chat-history-delete"
+                    className="ai-chat-history-native-link"
                     type="button"
-                    aria-label={`删除对话 ${thread.title}`}
-                    title="删除本地记录"
-                    disabled={thread.status === "running" || deletingThreadId === thread.id}
-                    onClick={() => void deleteThread(thread)}
+                    aria-label={`在 ${thread.providerId === "claude-code" ? "Claude Code" : "Codex"} 中打开 ${thread.title}`}
+                    title={thread.nativeThreadId
+                      ? `在 ${thread.providerId === "claude-code" ? "Claude Code" : "Codex"} 原生会话中继续`
+                      : "发送第一条消息后可在原生 Agent 会话中继续"}
+                    disabled={!thread.nativeThreadId}
+                    onClick={() => openNativeThread(thread)}
                   >
-                    <LinearIcon name="trash" />
+                    <LinearIcon name="openExternal" />
                   </button>
                 </div>
-              )) : (
+              )) : !draftOrigin ? (
                 <p>还没有本地对话</p>
-              )}
+              ) : null}
             </div>
+          )}
+
+          {threadContextMenu && createPortal(
+            <div
+              className="ai-chat-thread-context-menu"
+              role="menu"
+              style={{ left: threadContextMenu.x, top: threadContextMenu.y }}
+              onPointerDown={(event) => event.stopPropagation()}
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => void deleteThread(threadContextMenu.thread)}
+              >
+                <LinearIcon name="trash" />
+                删除会话
+              </button>
+            </div>,
+            document.body,
           )}
 
           <div
@@ -1954,7 +2051,7 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
                 {snapshot.thread.status === "running" && (
                   <div className="ai-chat-running" role="status">
                     <span className="ai-chat-spinner" />
-                    Codex 正在处理
+                    {snapshot.thread.providerId === "claude-code" ? "Claude Code" : "Codex"} 正在处理
                   </div>
                 )}
                 {retryableUserEvent && (
@@ -1977,10 +2074,12 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
             ) : (
               <div className="ai-chat-empty">
                 <LinearIcon name="conversation" />
-                <strong>{effectiveProjectId ? "在当前项目中开始对话" : "打开一个历史对话"}</strong>
-                <p>{projectId
-                  ? "Codex 会在新对话创建时记住当前项目。"
-                  : "进入项目后可以新建对话。"}</p>
+                <strong>{draftOrigin ? "新建 Agent 会话" : effectiveProjectId ? "选择历史会话或新建会话" : "请先配置修复仓库"}</strong>
+                <p>{draftOrigin
+                  ? `使用 ${draftProvider === "claude-code" ? "Claude Code" : "Codex"} 开始新会话，输入消息后发送。`
+                  : effectiveProjectId
+                    ? "点击左侧“新建会话”，然后选择 Agent 并发送第一条消息。"
+                    : "在右侧卡片信息中选择仓库和分支后即可创建会话。"}</p>
               </div>
             )}
           </div>
@@ -1998,9 +2097,9 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
                 ref={editorRef}
                 className="ai-chat-composer-editor"
                 contentEditable={!composerBlocked}
-                data-placeholder="询问 Codex"
+                data-placeholder={`询问 ${activeProviderId === "claude-code" ? "Claude Code" : "Codex"}`}
                 role="textbox"
-                aria-label="发送给 Codex 的消息"
+                aria-label={`发送给 ${activeProviderId === "claude-code" ? "Claude Code" : "Codex"} 的消息`}
                 aria-multiline="true"
                 suppressContentEditableWarning
                 onBeforeInput={(event) => rememberComposerBeforeInput(event.nativeEvent as InputEvent)}
@@ -2080,6 +2179,25 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
             </div>
 
             <div className="ai-chat-composer-toolbar">
+              <label className="ai-chat-runtime-picker">
+                <span className="sr-only">执行器</span>
+                <select
+                  aria-label="选择执行器"
+                  value={activeProviderId}
+                  disabled={Boolean(snapshot) || loading}
+                  onChange={(event) => {
+                    const providerId = event.target.value as AiChatProvider;
+                    setDraftProvider(providerId);
+                    setDraftModel(providerId === "claude-code" ? "sonnet" : DEFAULT_AI_MODEL);
+                    setDraftEffort("");
+                    setMenu(null);
+                    setError(null);
+                  }}
+                >
+                  <option value="codex">Codex Agent</option>
+                  <option value="claude-code">Claude Code Agent</option>
+                </select>
+              </label>
               <div className="ai-chat-menu-wrap ai-chat-permission-menu-wrap">
                 <button
                   className="ai-chat-permission-trigger"
@@ -2101,7 +2219,7 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
                 {menu === "sandbox" && (
                   <div className="ai-chat-option-menu ai-chat-permission-menu" role="menu" aria-label="执行权限">
                     <header>
-                      <span>应如何批准 Codex 操作？</span>
+                      <span>应如何批准 {activeProviderId === "claude-code" ? "Claude Code" : "Codex"} 操作？</span>
                       <a
                         href="https://developers.openai.com/codex/security"
                         target="_blank"

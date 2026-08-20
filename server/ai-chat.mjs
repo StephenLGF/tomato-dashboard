@@ -13,8 +13,10 @@ import {
   setCodexThreadName,
 } from "./ai-chat-catalog.mjs";
 import {
+  buildClaudeArgs,
   buildCodexArgs,
   buildCodexPrompt,
+  normalizeClaudeEvent,
   normalizeCodexEvent,
   spawnCodexAppServerTurn,
   spawnCodexTurn,
@@ -80,6 +82,7 @@ export class AiChatService {
   constructor(options) {
     this.database = options.database;
     this.codexExecutable = options.codexExecutable;
+    this.claudeExecutable = options.claudeExecutable ?? "claude";
     this.codexStatePath = options.codexStatePath;
     this.fallbackWorkspacePath = options.fallbackWorkspacePath ?? null;
     this.tomatoWorkboardSkillPath = options.tomatoWorkboardSkillPath;
@@ -188,6 +191,7 @@ export class AiChatService {
 
   async syncNativeThread(threadId) {
     const thread = this.getThread(threadId);
+    if (thread.providerId !== "codex") return 0;
     if (!thread.codexThreadId) return 0;
     const [nativeMessages, existingEvents] = await Promise.all([
       this.readCodexThreadMessages(this.codexStatePath, thread.codexThreadId),
@@ -242,7 +246,19 @@ export class AiChatService {
     };
   }
 
-  async getCatalog(projectId) {
+  async getCatalog(projectId, providerId = "codex") {
+    if (providerId === "claude-code") {
+      return {
+        providerId,
+        agents: [{ id: "claude-default", name: "Claude Code" }],
+        models: [{
+          slug: "sonnet", displayName: "Claude Sonnet", description: "Claude Code default coding model",
+          defaultReasoningEffort: "medium", supportedReasoningEfforts: ["medium"], serviceTiers: [],
+        }],
+        skills: [],
+        sandboxes: ["read-only", "workspace-write", "danger-full-access"],
+      };
+    }
     return discoverAiCatalog({
       codexExecutable: this.codexExecutable,
       codexStatePath: this.codexStatePath,
@@ -254,8 +270,9 @@ export class AiChatService {
   }
 
   async createThread(input) {
+    const providerId = input.providerId ?? "codex";
     const [catalog, resolved] = await Promise.all([
-      this.getCatalog(input.projectId),
+      this.getCatalog(input.projectId, providerId),
       resolveAiWorkspace(
         input.projectId,
         this.codexStatePath,
@@ -288,7 +305,7 @@ export class AiChatService {
 
     if (issueIdentifier) {
       const existing = this.database.listAiChatThreads({ issueIdentifier })
-        .find((thread) => thread.origin.projectId === resolved.project.id);
+        .find((thread) => thread.origin.projectId === resolved.project.id && thread.providerId === providerId);
       if (existing) return existing;
     }
 
@@ -296,7 +313,7 @@ export class AiChatService {
     const threadId = issue?.projectId === "tomato"
       && resolved.project.id === "tomato"
       && issueIdentifier
-      ? `tomato:${issueIdentifier}`
+      ? providerId === "codex" ? `tomato:${issueIdentifier}` : `tomato:${issueIdentifier}:${providerId}`
       : undefined;
     const defaultTitle = conversationTitle(issue, issueIdentifier);
     try {
@@ -310,6 +327,7 @@ export class AiChatService {
           ...(issue ? { issueId: issue.id, issueIdentifier } : {}),
         },
         gitBranch,
+        providerId,
         reasoningEffort,
         sandbox,
       });
@@ -329,7 +347,7 @@ export class AiChatService {
 
     if (Object.hasOwn(changes, "sandbox")) this.#validateSandbox(changes.sandbox);
     if (Object.hasOwn(changes, "reasoningEffort")) {
-      const catalog = await this.getCatalog(thread.origin.projectId);
+      const catalog = await this.getCatalog(thread.origin.projectId, thread.providerId);
       thread = this.getThread(threadId);
       const model = this.#resolveModel(catalog);
       const reasoningEffort = changes.reasoningEffort ?? thread.reasoningEffort;
@@ -377,7 +395,7 @@ export class AiChatService {
     }
 
     const [catalog, resolved] = await Promise.all([
-      this.getCatalog(thread.origin.projectId),
+      this.getCatalog(thread.origin.projectId, thread.providerId),
       resolveAiWorkspace(
         thread.origin.projectId,
         this.codexStatePath,
@@ -401,7 +419,7 @@ export class AiChatService {
         "danger-full-access must be confirmed for every turn",
       );
     }
-    const recordedModelSlug = thread.codexThreadId
+    const recordedModelSlug = thread.providerId === "codex" && thread.codexThreadId
       ? await this.readCodexThreadModel(this.codexStatePath, thread.codexThreadId)
       : null;
     const recordedModel = recordedModelSlug
@@ -448,7 +466,7 @@ export class AiChatService {
       imagePaths,
     } = await this.#writeTurnAttachments(attachments);
     try {
-      const args = thread.codexThreadId
+      const args = thread.providerId === "codex" && thread.codexThreadId
         ? buildCodexArgs(
           thread,
           resolved.addDirectories,
@@ -485,11 +503,41 @@ export class AiChatService {
       });
       this.#emit(threadId, { type: "ai.event", event: userEvent });
 
-      const resumingThreadId = thread.codexThreadId;
+      const resumingThreadId = thread.nativeThreadId;
       let startedThreadId = null;
       let terminalOutcome = null;
       let terminalError = "";
-      const { child, completion } = thread.codexThreadId
+      const { child, completion } = thread.providerId === "claude-code"
+        ? spawnCodexTurn({
+          executable: this.claudeExecutable,
+          args: buildClaudeArgs(thread, resolved.addDirectories, model.slug),
+          prompt,
+          env: this.processEnv,
+          onRawEvent: (raw) => {
+            const normalized = normalizeClaudeEvent(raw);
+            if (!normalized) return;
+            if (normalized.kind === "thread.started" || normalized.kind === "result") {
+              if (normalized.threadId) {
+                if (startedThreadId && normalized.threadId !== startedThreadId) {
+                  throw new Error("Claude Code returned an unexpected session id");
+                }
+                startedThreadId = normalized.threadId;
+                this.database.updateAiChatThread(threadId, { nativeThreadId: normalized.threadId });
+              }
+              if (normalized.kind === "result") {
+                terminalOutcome = normalized.outcome;
+                terminalError ||= normalized.error;
+              }
+              return;
+            }
+            const event = this.database.insertAiChatEvent({
+              threadId, runId: run.id, type: normalized.type, role: normalized.role,
+              content: normalized.content, data: normalized.data,
+            });
+            this.#emit(threadId, { type: "ai.event", event });
+          },
+        })
+        : thread.codexThreadId
         ? spawnCodexTurn({
           executable: this.codexExecutable,
           args,
@@ -506,7 +554,7 @@ export class AiChatService {
               throw new Error("Codex returned an unexpected thread id");
             }
             startedThreadId = normalized.threadId;
-            this.database.updateAiChatThread(threadId, { codexThreadId: normalized.threadId });
+            this.database.updateAiChatThread(threadId, { codexThreadId: normalized.threadId, nativeThreadId: normalized.threadId });
             return;
           }
           const event = this.database.insertAiChatEvent({
@@ -542,7 +590,7 @@ export class AiChatService {
                 throw new Error("Codex returned an unexpected thread id");
               }
               startedThreadId = normalized.threadId;
-              this.database.updateAiChatThread(threadId, { codexThreadId: normalized.threadId });
+              this.database.updateAiChatThread(threadId, { codexThreadId: normalized.threadId, nativeThreadId: normalized.threadId });
               return;
             }
             const event = this.database.insertAiChatEvent({
@@ -801,7 +849,7 @@ export class AiChatService {
       if (finalBranch && (!thread.gitBranch || finalBranch !== active.startingBranch)) {
         this.database.updateAiChatThread(run.threadId, { gitBranch: finalBranch });
       }
-      if (thread.codexThreadId) {
+      if (thread.providerId === "codex" && thread.codexThreadId) {
         await this.syncNativeThreadName(thread.codexThreadId).catch(() => {});
       }
       this.#emit(run.threadId, { type: "ai.run", run: updated });

@@ -330,6 +330,66 @@ export function normalizeCodexEvent(raw) {
   return normalizedItem(raw.type, raw.item);
 }
 
+export function buildClaudeArgs(thread, addDirectories, launchModel = "sonnet") {
+  const args = [
+    "-p",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--model", launchModel,
+  ];
+  if (thread.nativeThreadId) args.push("--resume", thread.nativeThreadId);
+  for (const directory of addDirectories) args.push("--add-dir", directory);
+  if (thread.sandbox === "read-only") args.push("--permission-mode", "plan");
+  if (thread.sandbox === "danger-full-access") args.push("--dangerously-skip-permissions");
+  return args;
+}
+
+export function normalizeClaudeEvent(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const sessionId = typeof raw.session_id === "string" ? raw.session_id : null;
+  if (raw.type === "system" && raw.subtype === "init" && sessionId) {
+    return { kind: "thread.started", threadId: sessionId };
+  }
+  if (raw.type === "assistant" && Array.isArray(raw.message?.content)) {
+    const text = raw.message.content
+      .filter((item) => item?.type === "text" && typeof item.text === "string")
+      .map((item) => item.text)
+      .join("\n")
+      .trim();
+    if (text) return { kind: "event", type: "agent_message", role: "assistant", content: cappedText(text), data: {} };
+    const tool = raw.message.content.find((item) => item?.type === "tool_use");
+    if (tool) {
+      return {
+        kind: "event",
+        type: "mcp_tool_call",
+        role: "activity",
+        content: cappedText(tool.name),
+        data: { tool: cappedText(tool.name), detail: detailText(tool.input), status: "started" },
+      };
+    }
+  }
+  if (raw.type === "result") {
+    const resultError = typeof raw.result === "string"
+      ? raw.result
+      : Array.isArray(raw.errors) ? raw.errors.filter((value) => typeof value === "string").join("\n") : "";
+    if (sessionId) {
+      return {
+        kind: "result",
+        threadId: sessionId,
+        outcome: raw.is_error ? "failed" : "completed",
+        error: raw.is_error ? cappedText(resultError) : "",
+      };
+    }
+    return {
+      kind: "result",
+      threadId: null,
+      outcome: raw.is_error ? "failed" : "completed",
+      error: raw.is_error ? cappedText(resultError) : "",
+    };
+  }
+  return null;
+}
+
 
 function appServerPermission(thread) {
   if (thread.sandbox === "read-only") {

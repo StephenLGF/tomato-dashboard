@@ -12,7 +12,7 @@ import {
   type SetStateAction,
 } from "react";
 import { FolderOpenOutlined, HomeOutlined, MoonOutlined, RobotOutlined, SunOutlined } from "@ant-design/icons";
-import { ConfigProvider, Layout, Menu, Switch, Typography, message as antdMessage, theme as antdTheme } from "antd";
+import { ConfigProvider, Layout, Menu, Segmented, Switch, Typography, message as antdMessage, theme as antdTheme } from "antd";
 // @ts-expect-error Shared runtime constants are verified by focused node tests.
 import { isVisibleTomatoStatus } from "../../shared/tomato-statuses.mjs";
 // @ts-expect-error Shared Tomato identity parsing is verified by focused node tests.
@@ -473,6 +473,7 @@ function TaskboardApp({
   const [errorCopied, setErrorCopied] = useState(false);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [search, setSearch] = useState("");
+  const [tomatoItemTypeFilter, setTomatoItemTypeFilter] = useState<"all" | "story" | "bug">("all");
   const [filters, setFilters] = useState(readTaskFilters);
   const [showEmptyColumns, setShowEmptyColumns] = useState(readShowEmptyColumns);
   const [columnVisibilityByProject, setColumnVisibilityByProject] = useState(readColumnVisibilityByProject);
@@ -1222,15 +1223,20 @@ function TaskboardApp({
   const filteredTasks = useMemo(() => {
     const normalizedSearch = search.trim().toLowerCase();
     return tasks.filter((task) => {
+      const itemType = task.description.match(/(?:^|\n)类型：([^\n]+)/)?.[1]?.trim() ?? "";
+      const matchesTomatoType = !isTomatoBoard
+        || tomatoItemTypeFilter === "all"
+        || (tomatoItemTypeFilter === "story" && ["Story", "EnablerStory"].includes(itemType))
+        || (tomatoItemTypeFilter === "bug" && ["Bug", "缺陷", "测试缺陷"].includes(itemType));
       const matchesSearch = isTomatoBoard
         ? !normalizedSearch || [task.title, task.creatorName, ...task.labels]
           .join(" ")
           .toLowerCase()
           .includes(normalizedSearch)
         : matchesTaskSearch(task, search);
-      return matchesSearch && matchesTaskFilters(task, filters);
+      return matchesTomatoType && matchesSearch && matchesTaskFilters(task, filters);
     });
-  }, [filters, isTomatoBoard, search, tasks]);
+  }, [filters, isTomatoBoard, search, tasks, tomatoItemTypeFilter]);
 
   const tomatoTasksByStatus = useMemo(() => {
     const groups = new Map<string, Task[]>();
@@ -1863,52 +1869,6 @@ function TaskboardApp({
     }
   }
 
-  async function selectTomatoRepository(projectId: string) {
-    if (tomatoRepositoryLoading) return;
-    const choice = tomatoRepositoryOptions.find((project) => project.id === projectId);
-    if (!choice) return;
-    setTomatoRepositoryLoading(true);
-    setActionError(null);
-    try {
-      if (!projects.some((project) => project.id === choice.id)) {
-        try {
-          const project = await createProjectRequest({
-            id: choice.id,
-            name: choice.name,
-            workspacePath: null,
-          });
-          setProjects((current) => current.some((item) => item.id === project.id)
-            ? current
-            : [...current, project]);
-        } catch (error) {
-          if (!(error instanceof ApiError) || error.code !== "PROJECT_EXISTS") throw error;
-          setProjects(await listProjects());
-        }
-      }
-      setTomatoRepositoryProjectId(choice.id);
-      window.localStorage.setItem(TOMATO_REPOSITORY_PROJECT_KEY, choice.id);
-      if (detailTask?.projectId === "tomato") {
-        const storedRepositories = detailTask.tomatoRepositories ?? [];
-        const tomatoRepositories = storedRepositories.some((config) => config.projectId === choice.id)
-          ? storedRepositories
-          : [
-              ...storedRepositories,
-              { projectId: choice.id, developmentBranch: "", rebaseBranch: "" },
-            ];
-        const saved = await updateTaskRequest(detailTask, {
-          repositoryProjectId: choice.id,
-          tomatoRepositories,
-        });
-        setTasks((current) => current.map((task) => task.id === saved.id ? saved : task));
-      }
-      setAnnouncement(`番茄对话仓库已选择：${choice.name}`);
-    } catch (error) {
-      setActionError(errorMessage(error));
-    } finally {
-      setTomatoRepositoryLoading(false);
-    }
-  }
-
   async function updateTomatoRepositoryConfigs(configs: Task["tomatoRepositories"]) {
     if (!detailTask || detailTask.projectId !== "tomato") return;
     try {
@@ -2196,6 +2156,18 @@ function TaskboardApp({
                   />
                   {!search && <kbd>/</kbd>}
                 </label>
+                <Segmented
+                  className="tomato-type-filter"
+                  aria-label="按事项类型筛选"
+                  size="small"
+                  value={tomatoItemTypeFilter}
+                  options={[
+                    { label: "全部", value: "all" },
+                    { label: "Story", value: "story" },
+                    { label: "缺陷", value: "bug" },
+                  ]}
+                  onChange={(value) => setTomatoItemTypeFilter(value as "all" | "story" | "bug")}
+                />
                 <button
                   className={`icon-button tomato-analysis-start-button${tomatoAnalysisProgress.running ? " is-running" : ""}`}
                   type="button"
@@ -2440,10 +2412,16 @@ function TaskboardApp({
                 issueId={detailTaskId}
                 issueIdentifier={tomatoItemKeyFromTask(detailTask)}
                 repositoryProjectId={tomatoRepositoryProjectId || null}
+                repositoryProjectIds={(detailTask.tomatoRepositories ?? []).map((config) => config.projectId)}
                 repositoryOptions={tomatoRepositoryOptions}
                 repositoryLoading={tomatoRepositoryLoading}
-                onRepositoryChange={(projectId) => void selectTomatoRepository(projectId)}
-                hideRepositoryPicker
+                onRepositoryProjectsChange={(projectIds) => {
+                  const current = detailTask.tomatoRepositories ?? [];
+                  void updateTomatoRepositoryConfigs(projectIds.map((projectId) => (
+                    current.find((config) => config.projectId === projectId)
+                    ?? { projectId, developmentBranch: "", rebaseBranch: "" }
+                  )));
+                }}
                 inline
                 onOpenThread={openThread}
                 requestedThreadId={detailConversationIdentifier}

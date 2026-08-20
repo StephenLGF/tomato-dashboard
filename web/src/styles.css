@@ -1067,6 +1067,11 @@ kbd {
   margin-left: auto;
 }
 
+.tomato-type-filter {
+  flex: 0 0 auto;
+  border-radius: 8px;
+}
+
 .tomato-analysis-start-button.is-running {
   color: var(--accent);
   background: var(--accent-soft);
@@ -2147,6 +2152,10 @@ kbd {
   transition: border-color 100ms ease, background-color 100ms ease, box-shadow 100ms ease, opacity 100ms ease, transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
+.task-card.ant-card .ant-card-body {
+  display: contents;
+}
+
 .task-card:hover {
   z-index: 1;
   border-color: var(--border-strong);
@@ -2300,7 +2309,7 @@ kbd {
   outline-offset: -2px;
 }
 
-.task-card > :not(.task-card-open) {
+.task-card .ant-card-body > :not(.task-card-open) {
   position: relative;
   z-index: 2;
   pointer-events: none;
@@ -7497,24 +7506,27 @@ kbd {
   content: "";
 }
 
-.ai-chat-repository-picker {
+.ai-chat-repository-bar {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
-  gap: 4px;
-  color: var(--text-tertiary);
-  font-size: 10px;
+  padding: 8px 12px 10px;
+  background: var(--surface);
 }
 
-.ai-chat-repository-picker select {
-  max-width: 150px;
-  height: 26px;
-  padding: 0 20px 0 6px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 6px;
-  background: var(--surface-muted);
-  color: var(--text-primary);
+.ai-chat-repository-select {
+  width: min(420px, 100%);
+}
+
+.ai-chat-repository-select .ant-select-selector {
+  border-radius: 999px !important;
+  background: var(--surface-muted) !important;
   font-size: 11px;
+}
+
+.ai-chat-repository-select .ant-select-selection-item {
+  border-radius: 999px !important;
+  padding-inline: 8px !important;
 }
 
 .ai-chat-panel-header > button:not(.ai-chat-panel-title) {
@@ -7556,7 +7568,7 @@ kbd {
 .ai-chat-root.has-thread-list .ai-chat-panel.is-inline {
   display: grid;
   grid-template-columns: 248px minmax(0, 1fr);
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto minmax(0, 1fr) auto auto auto;
 }
 
 .ai-chat-root.has-thread-list .ai-chat-panel-header {
@@ -7571,6 +7583,11 @@ kbd {
   min-height: 0;
   border-right: var(--border-hairline) solid var(--border);
   background: var(--surface-muted);
+}
+
+.ai-chat-root.has-thread-list .ai-chat-repository-bar {
+  grid-column: 2;
+  grid-row: 4;
 }
 
 .ai-chat-root.has-thread-list .ai-chat-messages,
@@ -7588,13 +7605,13 @@ kbd {
 }
 
 .ai-chat-root.has-thread-list .ai-chat-composer {
-  grid-row: 4;
+  grid-row: 5;
 }
 
 @media (max-width: 760px) {
   .ai-chat-root.has-thread-list .ai-chat-panel.is-inline {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+    grid-template-rows: auto auto auto minmax(0, 1fr) auto auto;
   }
 
   .ai-chat-root.has-thread-list .ai-chat-history.is-persistent {
@@ -7603,6 +7620,11 @@ kbd {
     max-height: 176px;
     border-right: 0;
     border-bottom: var(--border-hairline) solid var(--border);
+  }
+
+  .ai-chat-root.has-thread-list .ai-chat-repository-bar {
+    grid-row: 5;
+    grid-column: 1;
   }
 
   .ai-chat-root.has-thread-list .ai-chat-messages {
@@ -7616,7 +7638,7 @@ kbd {
   }
 
   .ai-chat-root.has-thread-list .ai-chat-composer {
-    grid-row: 5;
+    grid-row: 6;
     grid-column: 1;
   }
 }

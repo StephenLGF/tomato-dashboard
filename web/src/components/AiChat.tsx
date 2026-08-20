@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { Select } from "antd";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -58,10 +59,11 @@ interface AiChatProps {
   issueId: string | null;
   issueIdentifier?: string | null;
   repositoryProjectId?: string | null;
+  repositoryProjectIds?: string[];
   repositoryOptions?: Array<{ id: string; name: string }>;
   repositoryLoading?: boolean;
   onRepositoryChange?: (projectId: string) => void;
-  hideRepositoryPicker?: boolean;
+  onRepositoryProjectsChange?: (projectIds: string[]) => void;
   inline?: boolean;
   onOpenThread?: (threadId: string, title?: string) => void;
   requestedThreadId?: string | null;
@@ -801,10 +803,11 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
   issueId,
   issueIdentifier = null,
   repositoryProjectId = null,
+  repositoryProjectIds,
   repositoryOptions,
   repositoryLoading = false,
   onRepositoryChange,
-  hideRepositoryPicker = false,
+  onRepositoryProjectsChange,
   inline = false,
   onOpenThread,
   requestedThreadId = null,
@@ -847,8 +850,9 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
   );
   const [panelResizeEdge, setPanelResizeEdge] = useState<PanelResizeEdge | null>(null);
   const singleIssueConversation = Boolean(issueIdentifier);
-  const repositorySelectionEnabled = Boolean(repositoryOptions && onRepositoryChange);
-  const effectiveProjectId = repositorySelectionEnabled ? repositoryProjectId : projectId;
+  const selectedRepositoryProjectIds = repositoryProjectIds ?? (repositoryProjectId ? [repositoryProjectId] : []);
+  const repositorySelectionEnabled = Boolean(repositoryOptions && (onRepositoryProjectsChange || onRepositoryChange));
+  const effectiveProjectId = repositorySelectionEnabled ? selectedRepositoryProjectIds[0] ?? null : projectId;
   const editorRef = useRef<HTMLDivElement>(null);
   const skillMentionRangeRef = useRef<Range | null>(null);
   const composerBeforeInputRef = useRef<ComposerBeforeInput | null>(null);
@@ -1422,8 +1426,8 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
     restorePersistedConversationFromDraft();
   }, [draftOrigin?.issueId, draftOrigin?.projectId, effectiveProjectId, issueId]);
 
-  function changeRepository(nextProjectId: string) {
-    if (!onRepositoryChange || nextProjectId === repositoryProjectId) return;
+  function changeRepositories(nextProjectIds: string[]) {
+    if (nextProjectIds.join("\0") === selectedRepositoryProjectIds.join("\0")) return;
     draftReturnThreadIdRef.current = null;
     setDraftOrigin(null);
     setSnapshot(null);
@@ -1431,7 +1435,8 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
     resetComposer();
     setHistoryOpen(false);
     setError(null);
-    onRepositoryChange(nextProjectId);
+    if (onRepositoryProjectsChange) onRepositoryProjectsChange(nextProjectIds);
+    else if (nextProjectIds[0]) onRepositoryChange?.(nextProjectIds[0]);
   }
 
   function beginNewConversation() {
@@ -1873,21 +1878,6 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
                 <LinearIcon name="openExternal" />
               </button>
             )}
-            {repositorySelectionEnabled && !hideRepositoryPicker && (
-              <label className="ai-chat-repository-picker">
-                <select
-                  aria-label="选择仓库"
-                  value={repositoryProjectId ?? ""}
-                  disabled={repositoryLoading || loading}
-                  onChange={(event) => changeRepository(event.currentTarget.value)}
-                >
-                  <option value="">选择仓库</option>
-                  {(repositoryOptions ?? []).map((option) => (
-                    <option key={option.id} value={option.id}>{option.name}</option>
-                  ))}
-                </select>
-              </label>
-            )}
             {!singleIssueConversation && (
               <>
                 <button
@@ -2088,6 +2078,26 @@ export const AiChat = forwardRef<AiChatHandle, AiChatProps>(function AiChat({
             <div className="ai-chat-error" role="alert">
               <LinearIcon name="alert" />
               <span>{error ?? catalogError}</span>
+            </div>
+          )}
+
+          {repositorySelectionEnabled && (
+            <div className="ai-chat-repository-bar">
+              <Select
+                className="ai-chat-repository-select"
+                aria-label="选择工作仓库"
+                mode="multiple"
+                value={selectedRepositoryProjectIds}
+                placeholder="选择仓库"
+                size="small"
+                maxTagCount={2}
+                loading={repositoryLoading}
+                disabled={repositoryLoading || loading}
+                showSearch
+                optionFilterProp="label"
+                options={(repositoryOptions ?? []).map((option) => ({ value: option.id, label: option.name }))}
+                onChange={changeRepositories}
+              />
             </div>
           )}
 

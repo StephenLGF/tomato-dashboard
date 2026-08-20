@@ -1,4 +1,5 @@
 import type { MouseEvent } from "react";
+import { Card } from "antd";
 import { TASK_STATUSES, type Task, type TaskPriority, type TaskStatus } from "../types";
 import { ActorAvatar } from "./ActorAvatar";
 import { LinearIcon, LinearPriorityIcon } from "./LinearIcon";
@@ -91,7 +92,8 @@ export function TaskCard({
   }
 
   return (
-    <article
+    <Card
+      size="small"
       className={`task-card priority-${task.priority}${task.tomatoAnalysisDisabled ? " tomato-analysis-paused" : compactProperties?.tomatoAnalysis ? ` tomato-analysis-${compactProperties.tomatoAnalysis.status}` : ""}${compactProperties?.conversationActive ? " is-conversation-active" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}`}
       style={dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : undefined}
       draggable={!isMoving && !readOnly}
@@ -269,6 +271,6 @@ export function TaskCard({
           )}
         </>)}
       </div>
-    </article>
+    </Card>
   );
 }
